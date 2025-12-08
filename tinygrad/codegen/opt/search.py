@@ -82,11 +82,6 @@ def _try_compile(x:tuple[int,Scheduler], compiler:Compiler) -> tuple[int, tuple[
     if hasattr(signal, "alarm"): signal.alarm(0)
   return x[0], ret
 
-# workers should not open devices and should ignore ctrl c and should not launch VIZ
-def _init_worker():
-  Context(ALLOW_DEVICE_USAGE=0, VIZ=0, TRACK_MATCH_STATS=0).__enter__()
-  signal.signal(signal.SIGINT, signal.SIG_IGN)
-
 def _ensure_buffer_alloc(bufs:list[Buffer]) -> list[Buffer]: return [buf.ensure_allocated() if buf is not None else buf for buf in bufs]
 
 # *** external API ***
