@@ -115,9 +115,8 @@ def get_kernel_actions(s:Scheduler, include_0=True) -> dict[int, Scheduler]:
     except KernelOptError: pass
   return acted
 
-beam_pool, BEAM_DEBUG = None, getenv("BEAM_DEBUG")
+BEAM_DEBUG = getenv("BEAM_DEBUG")
 def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True, disable_cache=IGNORE_BEAM_CACHE.value):
-  global beam_pool
   key = {"ast": s.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": s.ren.device, "suffix": s.ren.suffix}
   if not disable_cache and CACHELEVEL >= 1 and (val:=diskcache_get("beam_search", key)) is not None:
     ret = s.copy()
@@ -126,12 +125,6 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
 
   beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
   seen_libs = set()
-
-  default_parallel = multiprocessing.cpu_count() if s.ren.device in {"CUDA", "AMD", "NV", "METAL", "HIP"} else 0
-  if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
-    beam_pool = multiprocessing.get_context("spawn").Pool(workers, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
-    @atexit.register
-    def close_pool(): beam_pool.close()
 
   min_progress = getenv("BEAM_MIN_PROGRESS", 0.01)/1e6
   if BEAM_DEBUG:
@@ -149,7 +142,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
       timed: list[tuple[Scheduler, float]] = []
       _compile_fn = functools.partial(_try_compile, compiler=dev.compiler)
       least_compute_ops = math.inf
-      for i,proc in (map(_compile_fn, enumerate(candidates)) if beam_pool is None else beam_pool.imap_unordered(_compile_fn, enumerate(candidates))):
+      for i,proc in (map(_compile_fn, enumerate(candidates))):
         if proc is None: continue
         p, lib, compile_et = proc
         if lib in seen_libs: continue
@@ -183,7 +176,6 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
         print(f"\r{time.perf_counter() - st:7.2f}s:", colored(time_to_str(beam[0][1], w=12), "green" if exiting else None),
               f"from {len(candidates):3d} -> {len(opts):3d} actions\033[K", beam[0][0].colored_shape())
   except KeyboardInterrupt as e:
-    if beam_pool is not None: beam_pool.terminate()
     raise e
 
   if CACHELEVEL >= 1: diskcache_put("beam_search", key, beam[0][0].applied_opts)
