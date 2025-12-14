@@ -342,6 +342,10 @@ def apply_opts(ast:UOp, ren:Renderer) -> UOp:
     from tinygrad.codegen.opt.search import beam_search
     rawbufs = bufs_from_ast(ast, ren.device)
     k = beam_search(k, rawbufs, BEAM.value, bool(getenv("BEAM_ESTIMATE", 1)))
+  elif bool(getenv("GENETIC", 1)):
+    from tinygrad.codegen.opt.search import ga_search
+    rawbufs = bufs_from_ast(ast, ren.device)
+    k = ga_search(k, rawbufs)
   elif not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
     # NOTE: hand_coded_optimizations doesn't support multiblock opts yet

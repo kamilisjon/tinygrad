@@ -24,6 +24,8 @@ actions += [Opt(op=OptOps.SWAP, axis=axis_0, arg=axis_1) for axis_0 in range(5) 
 actions += [Opt(op=OptOps.THREAD, axis=axis, arg=amt) for amt in [2,3,4,5,8,12,16,24,32,64] for axis in range(3)]
 if getenv("NOLOCALS"): actions += [Opt(op=OptOps.NOLOCALS)]
 
+print(len(actions))
+
 def get_test_global_size(global_size, max_global_size, var_vals):
   test_global_size = [sym_infer(sz, var_vals) for sz in global_size]
   input_size = prod(test_global_size)
@@ -127,52 +129,184 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
     print(pyrender(s.ast.replace(arg=None)))
   if DEBUG >= 2: print(f"   0.00s:                from   1 ->   1 actions {s.colored_shape()}")
 
-  try:
-    rawbufs = _ensure_buffer_alloc(rawbufs)
-    var_vals: dict[str, int] = {k.expr:int(k.vmax+k.vmin)//2 for k in s.ast.variables()}
-    exiting, st = False, time.perf_counter()
-    dev = Device[s.ren.device]
-    while not exiting:
-      candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
-      timed: list[tuple[Scheduler, float]] = []
-      _compile_fn = functools.partial(_try_compile, compiler=dev.compiler)
-      least_compute_ops = math.inf
-      for i,proc in (map(_compile_fn, enumerate(candidates))):
-        if proc is None: continue
-        p, lib, compile_et = proc
-        if lib in seen_libs: continue
-        # filter out kernels that use 1000x more compute than the smallest
-        least_compute_ops = min(this_compute_ops:=sym_infer(p.estimates.ops, var_vals), least_compute_ops)
-        if least_compute_ops*1000 < this_compute_ops:
-          if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too much compute. {this_compute_ops} when least is {least_compute_ops}")
-          continue
-        seen_libs.add(lib)
-        try: tms = _time_program(p, lib, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0,
-                                 allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'))
-        except Exception as e:
-          if BEAM_DEBUG: print(f"BEAM failed for opts: {candidates[i].applied_opts}\n{e}")
-          if isinstance(e, RuntimeError): continue
-          raise
-        timed.append((candidates[i], min(tms)))
-        if BEAM_DEBUG > 1:
-          print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {len(unwrap(p.uops)):5d} uops",
-                f"{time_to_str(compile_et, w=12)} compile/{time_to_str(timed[-1][1], w=12)} run",
-                f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}")
-        elif DEBUG >= 2:
-          print(f"\r{time.perf_counter() - st:7.2f}s: {time_to_str(timed[-1][1], w=12)}",
-                f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}\033[K", end="")
+  rawbufs = _ensure_buffer_alloc(rawbufs)
+  var_vals: dict[str, int] = {k.expr:int(k.vmax+k.vmin)//2 for k in s.ast.variables()}
+  exiting, st = False, time.perf_counter()
+  dev = Device[s.ren.device]
+  while not exiting:
+    candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
+    timed: list[tuple[Scheduler, float]] = []
+    _compile_fn = functools.partial(_try_compile, compiler=dev.compiler)
+    least_compute_ops = math.inf
+    for i,proc in (map(_compile_fn, enumerate(candidates))):
+      if proc is None: continue
+      p, lib, compile_et = proc
+      if lib in seen_libs: continue
+      # filter out kernels that use 1000x more compute than the smallest
+      least_compute_ops = min(this_compute_ops:=sym_infer(p.estimates.ops, var_vals), least_compute_ops)
+      if least_compute_ops*1000 < this_compute_ops:
+        if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too much compute. {this_compute_ops} when least is {least_compute_ops}")
+        continue
+      seen_libs.add(lib)
+      try: tms = _time_program(p, lib, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0,
+                                allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'))
+      except Exception as e:
+        if BEAM_DEBUG: print(f"BEAM failed for opts: {candidates[i].applied_opts}\n{e}")
+        if isinstance(e, RuntimeError): continue
+        raise
+      timed.append((candidates[i], min(tms)))
+      if BEAM_DEBUG > 1:
+        print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {len(unwrap(p.uops)):5d} uops",
+              f"{time_to_str(compile_et, w=12)} compile/{time_to_str(timed[-1][1], w=12)} run",
+              f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}")
+      elif DEBUG >= 2:
+        print(f"\r{time.perf_counter() - st:7.2f}s: {time_to_str(timed[-1][1], w=12)}",
+              f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}\033[K", end="")
 
-      # done
-      opts = sorted(timed, key=lambda x: x[1])
-      exiting = len(opts) == 0 or (opts[0][1] < min_progress) or (len(beam) > 0 and ((beam[0][1]-opts[0][1]) < min_progress))
-      if not exiting: beam = opts[:amt]
-      elif len(opts) > 0 and opts[0][1] < beam[0][1]: beam = opts[:1]
-      if DEBUG >= 2:
-        print(f"\r{time.perf_counter() - st:7.2f}s:", colored(time_to_str(beam[0][1], w=12), "green" if exiting else None),
-              f"from {len(candidates):3d} -> {len(opts):3d} actions\033[K", beam[0][0].colored_shape())
-  except KeyboardInterrupt as e:
-    raise e
+    # done
+    opts = sorted(timed, key=lambda x: x[1])
+    exiting = len(opts) == 0 or (opts[0][1] < min_progress) or (len(beam) > 0 and ((beam[0][1]-opts[0][1]) < min_progress))
+    if not exiting: beam = opts[:amt]
+    elif len(opts) > 0 and opts[0][1] < beam[0][1]: beam = opts[:1]
+    if DEBUG >= 2:
+      print(f"\r{time.perf_counter() - st:7.2f}s:", colored(time_to_str(beam[0][1], w=12), "green" if exiting else None),
+            f"from {len(candidates):3d} -> {len(opts):3d} actions\033[K", beam[0][0].colored_shape())
 
   if CACHELEVEL >= 1: diskcache_put("beam_search", key, beam[0][0].applied_opts)
   if BEAM_DEBUG: print(f"BEAM_SEARCH: final tm={time_to_str(beam[0][1], w=0)}, applied_opts={beam[0][0].applied_opts}")
   return beam[0][0]
+
+CELL_LENGTH = 16
+import random
+
+def try_optimize(s: Scheduler, opts: list[Opt]) -> Scheduler: 
+  max_up, max_lcl = getenv("BEAM_UPCAST_MAX", 256), getenv("BEAM_LOCAL_MAX", 1024)
+  success = False
+  for o in opts:
+    if o.axis is not None and o.op is not OptOps.TC:
+      try: ax = s.real_axis(o.op, o.axis)
+      except KernelOptError: continue
+      if (ax >= s.shape_len) or (s.full_shape[ax] == o.arg and Opt(o.op, o.axis, 0) in opts): continue
+    try:
+      s.apply_opt(o)
+      up, lcl, tc_up = 1, 1, prod(tc.dims)//tc.threads if hasattr(s, 'tensor_core') and (tc:=s.tensor_core) else 1
+      for x,t in zip(s.full_shape, s.axis_types):
+        if t in (AxisType.UPCAST, AxisType.UNROLL): up *= x
+        elif t in (AxisType.WARP, AxisType.LOCAL, AxisType.GROUP_REDUCE): lcl *= x
+      if up//tc_up > max_up or lcl > max_lcl:
+        if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many upcast/local. {up//tc_up=}, {max_up=}, {lcl=}, {max_lcl=}")
+        continue
+      success = True
+    except KernelOptError: pass
+  if not success:
+    raise KernelOptError
+  return s
+
+def cross_over(s: Scheduler, opts: tuple[list[Opt], list[Opt]]) -> tuple[list[Opt], list[Opt]]:
+  found_new = False
+  for _ in range(CELL_LENGTH):
+    cut = random.randint(1, CELL_LENGTH - 1)
+    new1, new2 = opts[0][:cut] + opts[1][cut:], opts[0][cut:] + opts[1][:cut]
+    try: try_optimize(s.copy(), new1), try_optimize(s.copy(), new2)
+    except KernelOptError: continue
+    found_new = True
+    break
+  if not found_new:
+      new1, new2 = opts[0].copy(), opts[1].copy()
+  return (new1, new2)
+
+def mutate(s: Scheduler, opts:list[Opt]) -> list[Opt]:
+  import numpy as np
+  found_new = False
+  for _ in range(CELL_LENGTH):
+    new = opts.copy()
+    mask = np.random.rand(CELL_LENGTH) < 0.05
+    for idx in range(len(mask)):
+      if mask[idx]: continue
+      new[idx] = random.choice(actions)
+    try: try_optimize(s.copy(), new)
+    except KernelOptError: continue
+    found_new = True
+    break 
+  if not found_new:
+    new = opts.copy()
+  return new
+
+def generate_initial(s: Scheduler) -> list[Opt]:
+  while 1:
+    opts = [random.choice(actions) for _ in range(CELL_LENGTH)]
+    try: try_optimize(s.copy(), opts)
+    except KernelOptError: continue
+    break
+  return opts
+
+def ga_search(s:Scheduler, rawbufs:list[Buffer], allow_test_size=True):
+  dev = Device[s.ren.device]
+  rawbufs = _ensure_buffer_alloc(rawbufs)
+  var_vals = {k.expr:int(k.vmax+k.vmin)//2 for k in s.ast.variables()}
+
+  POP = 12
+  GENERATIONS = 30
+
+  # --- INITIAL POPULATION ---
+  population = [generate_initial(s) for _ in range(POP)]
+  best_sched, best_score = None, float("inf")
+
+  _compile_fn = functools.partial(_try_compile, compiler=dev.compiler)
+  least_compute_ops = math.inf
+  rawbufs = _ensure_buffer_alloc(rawbufs)
+  exiting, st = False, time.perf_counter()
+  # --- MAIN LOOP ---
+  for _ in range(GENERATIONS):
+    timed: list[tuple[Scheduler, float]] = []
+    candidates = [try_optimize(s.copy(), opts) for opts in population]
+    for i,proc in (map(_compile_fn, enumerate(candidates))):
+      if proc is None: continue
+      p, lib, compile_et = proc
+      # filter out kernels that use 1000x more compute than the smallest
+      least_compute_ops = min(this_compute_ops:=sym_infer(p.estimates.ops, var_vals), least_compute_ops)
+      if least_compute_ops*1000 < this_compute_ops:
+        if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too much compute. {this_compute_ops} when least is {least_compute_ops}")
+        timed.append((population[i], float("inf")))
+        continue
+      try: tms = _time_program(p, lib, var_vals, rawbufs, early_stop=1.0,
+                                allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'))
+      except Exception as e:
+        timed.append((population[i], float("inf")))
+        continue
+
+      timed.append((population[i], min(tms)))
+      if BEAM_DEBUG > 1:
+        print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {len(unwrap(p.uops)):5d} uops",
+              f"{time_to_str(compile_et, w=12)} compile/{time_to_str(timed[-1][1], w=12)} run",
+              f"      {len(timed):4d}/{len(population):4d}         {candidates[i].colored_shape()}")
+      elif DEBUG >= 2:
+        print(f"\r{time.perf_counter() - st:7.2f}s: {time_to_str(timed[-1][1], w=12)}",
+              f"      {len(timed):4d}/{len(population):4d}         {candidates[i].colored_shape()}\033[K", end="")
+
+    timed.sort(key=lambda x: x[1])
+
+    # update best
+    if timed[0][1] < best_score:
+      best_score = timed[0][1]
+      best_sched = try_optimize(s.copy(), timed[0][0])
+
+    # selection
+    parents = [x[0] for x in timed[:2]]
+    p1, p2 = parents
+
+    # next generation
+    next_pop = parents.copy()
+    while len(next_pop) < POP:
+      c1, c2 = cross_over(s, (p1, p2))
+      c1 = mutate(s, c1)
+      c2 = mutate(s, c2)
+      next_pop.extend([c1, c2])
+
+    population = next_pop.copy()
+
+  # --- FINISH ---
+  if best_sched is None:
+    best_sched = s
+
+  return best_sched
