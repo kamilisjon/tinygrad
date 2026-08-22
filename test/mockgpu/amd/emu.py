@@ -75,6 +75,7 @@ MASK32 = 0xFFFFFFFF
 
 # SQTT encoder lives in sqtt_enc.py; traces are consumed by amdgpu.py
 from test.mockgpu.amd.sqtt_enc import make_encoder as _make_sqtt_encoder
+SQTT_FRONTEND_CYCLES = 4  # measured dispatch->exec depth on gfx1102 with nothing else in flight
 sqtt_traces: list[bytes] = []
 
 def _c(val, dtype=dtypes.uint32): return UOp.const(val, dtype)
@@ -1918,7 +1919,7 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
 
   # Initialize SQTT encoder — emits packets inline as instructions execute (only when profiling)
   if PROFILE:
-    sqtt_emit, sqtt_finish, sqtt_finalize = _make_sqtt_encoder()
+    sqtt_emit, sqtt_exec, sqtt_finish, sqtt_finalize = _make_sqtt_encoder()
 
   def _ensure_compiled(pc: int) -> tuple[Callable, list[int], bool, Inst]:
     if pc not in program:
@@ -1943,6 +1944,9 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
                          ctypes.c_uint64(scratch_buf._buf.va_addr if scratch_buf else 0),
                          ctypes.c_uint64(st.accvgpr_buf._buf.va_addr)]))
     done = [False] * len(waves)
+    # timing model: one instruction dispatched per cycle, each reaching its pipe SQTT_FRONTEND_CYCLES
+    # later or when that pipe frees, whichever is later. dependency stalls are not modelled yet.
+    cycle, pipe_free = 0, {}
     for _ in range(10_000_000):
       if all(done): return
       for wi, (st, c_bufs) in enumerate(waves):
@@ -1952,14 +1956,20 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
           pc = st.pc
           if pc == ENDPGM_PC:
             done[wi] = True
-            if tracing: sqtt_finish(wi)
+            # the wave cannot retire before the pipes it fed have drained
+            if tracing: sqtt_finish(wi, max(cycle, *pipe_free.values()) if pipe_free else cycle)
             break
           fxn, globals_list, is_barrier, inst = _ensure_compiled(pc)
           if DEBUG >= 5: print(f"  exec gid=({gidx},{gidy},{gidz}) w={wi} PC={pc - lib}: {inst!r}", flush=True)
           fxn(*[c_bufs[g] for g in globals_list])
           if tracing:
             inst_op = inst.op.value if hasattr(inst, 'op') else 0
-            sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
+            queue, occupancy = sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None,
+                                         cycle)
+            if queue is not None:
+              sqtt_exec(queue, exec_at:=max(cycle + SQTT_FRONTEND_CYCLES, pipe_free.get(queue, 0)))
+              pipe_free[queue] = exec_at + occupancy
+            cycle += 1
           if is_barrier: break  # s_barrier hit: PC already advanced past it, pause this wave
         else: raise RuntimeError("exceeded 1M instructions in single wave, likely infinite loop")
       # All waves have either hit barrier or endpgm — release barrier waves for next round
