@@ -9,20 +9,16 @@ from tinygrad.runtime.autogen.amd.rdna3.ins import *
 import tinygrad.runtime.ops_amd  # noqa: F401  registers the SQTT_* ContextVars
 
 REF = "/tmp/tinygrad_sqtt_ref.pkl"
-KNAME, N_RUNS, N_SALU = "custom_sram_kernel", 2, 8
+KNAME, N_RUNS = "custom_sram_kernel", 2
 
 # SRAM-only kernels for making the emulator's SQTT output cycle accurate.
 
-def custom_sram_kernel(A:UOp) -> UOp:
+def custom_sram_kernel_single_add(A:UOp) -> UOp:
   A = A.flatten()
   threads = UOp.special(32, "lidx0")
   wg = UOp.special(1, "gidx0")
-  # SALU only: no VALU, no branches, no memory ops. A is bound but never touched.
-  # every s_add reads the s[1] the one above wrote, so the whole chain is serialized on one sgpr.
-  # writing to a different sgpr each time would make them independent and measure issue rate instead.
   insts = [
-    s_mov_b32(s[1], 1),
-    *[s_add_i32(s[1], s[1], 1) for _ in range(N_SALU)],
+    s_add_i32(s[10], s[10], 1),
     s_endpgm(),
   ]
   sink = UOp.sink(A.base, threads, wg, arg=KernelInfo(KNAME))
@@ -57,7 +53,7 @@ def capture(n_runs:int, simd_sel:int=0) -> tuple[list[list[bytes]], bytes, str]:
     start = len(Compiled.profile_events)
     emu.sqtt_traces.clear()
     with Context(SQTT_LIMIT_SE=1, SQTT_ITRACE_SE_MASK=1, SQTT_SIMD_SEL=simd_sel):
-      Tensor.custom_kernel(a, fxn=custom_sram_kernel)[0].realize()
+      Tensor.custom_kernel(a, fxn=custom_sram_kernel_single_add)[0].realize()
     Device[Device.DEFAULT].synchronize()
     if on_hw:
       evs = [e for e in Compiled.profile_events[start:] if type(e).__name__ == "ProfileSQTTEvent" and e.itrace]
