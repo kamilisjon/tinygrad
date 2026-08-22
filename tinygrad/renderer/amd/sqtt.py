@@ -651,14 +651,15 @@ class InstructionInfo:
   wave: int
   inst: Inst
 
-def map_insts(data:bytes, lib:bytes, target:str) -> Iterator[tuple[PacketType, InstructionInfo|None]]:
+def map_insts(data:bytes, lib:bytes, target:str, simd:int=0) -> Iterator[tuple[PacketType, InstructionInfo|None]]:
   """maps SQTT packets to instructions, yields (packet, instruction_info or None)"""
   # map pcs to insts
   from tinygrad.viz.serve import amd_decode
   pc_map = amd_decode(lib, target)
   wave_pc:dict[int, int] = {}
-  # only processing packets on one [CU, SIMD] unit
-  def simd_select(p) -> bool: return getattr(p, "cu", 0) == 0 and getattr(p, "simd", 0) == 0
+  # only processing packets on one [CU, SIMD] unit. packets without a simd field (INST, VALUINST,
+  # IMMEDIATE) are only emitted for the traced simd, so they default to it rather than to 0.
+  def simd_select(p) -> bool: return getattr(p, "cu", 0) == 0 and getattr(p, "simd", simd) == simd
   for p in decode(data):
     if not simd_select(p): continue
     if isinstance(p, (WAVESTART, WAVESTART_RDNA4, CDNA_WAVESTART)):
@@ -670,12 +671,17 @@ def map_insts(data:bytes, lib:bytes, target:str) -> Iterator[tuple[PacketType, I
     elif isinstance(p, IMMEDIATE_MASK):
       # immediate mask may yield multiple times per packet
       for wave in range(16):
-        if p.mask & (1 << wave):
+        if p.mask & (1 << wave) and wave in wave_pc:
           inst = pc_map[pc:=wave_pc[wave]]
           wave_pc[wave] += inst.size()
           yield (p, InstructionInfo(pc, wave, inst))
     # map INST events on this SIMD to the program counter, we know the waves
     elif isinstance(p, (VALUINST, INST, INST_RDNA4, IMMEDIATE)) and not (isinstance(p, (INST, INST_RDNA4)) and p.op.name.startswith("OTHER_")):
+      # an inst packet for a wave we never saw start means that wave ran on a different simd: its
+      # tokens reach us but its WAVESTART/WAVEEND were filtered out, so there is no pc to track
+      if p.wave not in wave_pc:
+        yield (p, None)
+        continue
       inst = pc_map[pc:=wave_pc[p.wave]]
       # s_delay_alu, s_wait_alu and s_barrier_wait instructions are skipped
       while (inst_op:=getattr(inst, 'op_name', '')) in {"S_DELAY_ALU", "S_WAIT_ALU", "S_BARRIER_WAIT"}:
