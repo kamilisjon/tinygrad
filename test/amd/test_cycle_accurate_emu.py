@@ -4,7 +4,7 @@ from tinygrad.device import Compiled
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.helpers import Context
 from tinygrad.renderer.amd.dsl import s, v
-from tinygrad.renderer.amd.sqtt import map_insts, INST, VALUINST, ALUEXEC, VMEMEXEC
+from tinygrad.renderer.amd.sqtt import map_insts, print_packets, INST, VALUINST, ALUEXEC, VMEMEXEC, SNAPSHOT
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 import tinygrad.runtime.ops_amd  # noqa: F401  registers the SQTT_* ContextVars
 
@@ -120,6 +120,12 @@ def sram_scope(blob:bytes, lib:bytes, arch:str, simd:int=0) -> list[tuple[int, i
   t0, pc0 = out[0][0], out[0][2]
   return [(t - t0, None if e is None else e - t0, pc - pc0, op) for t, e, pc, op in out]
 
+# SNAPSHOT is periodic hardware state with no decoded meaning and no token_exclude bit to turn it
+# off, so it is dropped here. NOSKIP=1 still shows the TS_DELTA/NOP padding print_packets hides.
+def dump_trace(label:str, raw:tuple):
+  print(f"\n  ===== full {label} sqtt trace =====")
+  print_packets((p, i) for p, i in map_insts(*raw) if not isinstance(p, SNAPSHOT))
+
 def insts_of(proj): return [(pc, op) for _, _, pc, op in proj]
 def times_of(proj): return [t for t, _, _, _ in proj]
 def execs_of(proj): return [e for _, e, _, _ in proj]
@@ -145,7 +151,9 @@ class TestSQTTEmu(unittest.TestCase):
     if not os.path.exists(REF): self.skipTest("no reference, run TestSQTTCapture on hardware first")
     with open(REF, "rb") as f: self.ref = pickle.load(f)
     runs, lib, arch = capture(1)
-    self.emu = sram_scope(runs[0][0], lib, arch)
+    self.emu_raw = (runs[0][0], lib, arch, 0)
+    self.hw_raw = (self.ref["runs"][0][0], self.ref["lib"], self.ref["arch"], self.ref["simd_sel"])
+    self.emu = sram_scope(*self.emu_raw)
     self.hw = _project(self.ref["runs"][0], self.ref["lib"], self.ref["arch"], self.ref["simd_sel"])
 
   def test_emu_matches_hw_instructions(self):
@@ -154,6 +162,8 @@ class TestSQTTEmu(unittest.TestCase):
   def test_emu_matches_hw_timing(self):
     ht, et = times_of(self.hw), times_of(self.emu)
     self.assertEqual(len(et), len(ht), "emulator and hardware executed a different number of instructions")
+    dump_trace("hw", self.hw_raw)
+    dump_trace("emu", self.emu_raw)
     hx, ex = execs_of(self.hw), execs_of(self.emu)
     f = lambda x: "-" if x is None else str(x)
     print(f"\n  {'#':>3} {'pc':>4}  {'instruction':<18} {'hw':>4} {'hw ex':>6} {'hw dly':>7} {'emu':>5} {'emu ex':>7} {'hw dt':>6} {'emu dt':>7}")
