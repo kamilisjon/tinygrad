@@ -1,5 +1,11 @@
 """Shared test helpers for AMD tests."""
 import ctypes
+from typing import Callable
+from tinygrad import Tensor, Device, dtypes
+from tinygrad.device import Compiled
+from tinygrad.helpers import Context
+from tinygrad.renderer.amd.sqtt import map_insts, print_packets, INST, VALUINST, ALUEXEC, VMEMEXEC, SNAPSHOT, LAYOUT_HEADER
+import tinygrad.runtime.ops_amd  # noqa: F401  registers the SQTT_* ContextVars
 from tinygrad.helpers import unwrap
 from tinygrad.runtime.autogen import llvm
 from tinygrad.runtime.support.elf import elf_loader
@@ -130,3 +136,116 @@ def llvm_filter_valid_asm(tests:list[tuple[str, bytes]], mcpu:str, mattr:str) ->
     start = idx + len(_SENTINEL)
   # Invalid instructions produce 0 bytes; also filter where LLVM roundtrip doesn't match original
   return [(asm, data) for (asm, data), chunk in zip(tests, results) if len(chunk) > 0 and chunk == data]
+
+# ── SQTT capture and projection, shared by test_simd_model and test_cycle_accurate_emu ──
+
+# link a trace to the exact binary that produced it via ProfileSQTTEvent.kern -> ProfileProgramEvent.tag,
+# the way viz and test_sqttmap do. matching on name alone can pick a stale build of an edited kernel.
+def _lib_for(kern:int|None, kname:str) -> bytes:
+  prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
+  if kern is not None:
+    assert (e:=prgs.get(kern)) is not None and e.lib, f"no ProfileProgramEvent tagged {kern}"
+    return e.lib
+  # the emulator emits no ProfileSQTTEvent, so there is no kern to link from
+  assert (c:=[e for e in prgs.values() if e.name == kname and e.lib]), f"no ProfileProgramEvent for {kname}, is PROFILE=1 set?"
+  return c[-1].lib
+
+def pkt_hist(blobs:list[bytes]) -> dict[str, int]:
+  from tinygrad.renderer.amd.sqtt import decode
+  import collections
+  c: collections.Counter = collections.Counter()
+  for b in blobs: c.update(type(x).__name__ for x in decode(b))
+  return dict(c)
+
+def capture(fxn:Callable, kname:str, n_runs:int=1, simd_sel:int=0) -> tuple[list[list[bytes]], bytes, str]:
+  import test.mockgpu.amd.emu as emu
+  on_hw = "MOCK" not in type(Device["AMD"].iface).__name__
+  a = Tensor.empty(32, dtype=dtypes.float32).contiguous().realize()
+  runs, kern = [], None
+  for _ in range(n_runs):
+    start = len(Compiled.profile_events)
+    emu.sqtt_traces.clear()
+    with Context(SQTT_LIMIT_SE=1, SQTT_ITRACE_SE_MASK=1, SQTT_SIMD_SEL=simd_sel):
+      Tensor.custom_kernel(a, fxn=fxn)[0].realize()
+    Device[Device.DEFAULT].synchronize()
+    if on_hw:
+      evs = [e for e in Compiled.profile_events[start:] if type(e).__name__ == "ProfileSQTTEvent" and e.itrace]
+      assert evs, "hardware produced no instruction-traced SQTT events, is SQTT=1 set?"
+      kern = evs[0].kern
+      runs.append([e.blob for e in evs])
+    else:
+      assert emu.sqtt_traces, "emulator produced no SQTT trace, is PROFILE=1 set?"
+      runs.append(list(emu.sqtt_traces))
+  return runs, _lib_for(kern, kname), Device["AMD"].arch
+
+def project(blobs:list[bytes], lib:bytes, arch:str, simd:int):
+  for b in blobs:
+    try: p = sram_scope(b, lib, arch, simd)
+    except KeyError: continue
+    if p: return p
+  return None
+
+# only one simd per se is instruction traced, and the dispatcher does not always put the wave on it:
+# even with a single CU enabled the two simds of that CU alternate between dispatches. so find the
+# traced simd once, then retry dispatches until n_runs of them actually landed on it.
+def capture_runs(fxn:Callable, kname:str, n_runs:int=1, max_dispatch:int=40):
+  sel, projs, raw, lib, arch, seen = None, [], [], None, None, {}
+  for _ in range(max_dispatch):
+    if len(projs) == n_runs: break
+    for simd_sel in (range(4) if sel is None else [sel]):
+      blobs, lib, arch = capture(fxn, kname, 1, simd_sel)
+      if (pr:=project(blobs[0], lib, arch, simd_sel)) is not None:
+        sel = simd_sel
+        projs.append(pr)
+        raw.append(blobs[0])
+        break
+      seen[simd_sel] = pkt_hist(blobs[0])
+  assert len(projs) == n_runs, \
+    f"only {len(projs)}/{n_runs} dispatches landed on a traced simd in {max_dispatch} tries; last packets seen: {seen}"
+  return projs, raw, lib, arch, sel
+
+# maps a dispatch packet's op category to the exec queue it will be retired from, same table viz uses
+_DISPATCH_TO_EXEC = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
+                     "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
+
+# project a raw blob down to SRAM scope: one entry per executed instruction on the traced SIMD, as
+# (dispatch time, exec time, pc, op name). dispatch is when the wave issued it, exec is when the pipe
+# started it, and exec is None for ops with no exec packet (branches). exec packets carry no wave or
+# pc, they are matched to dispatches in issue order per exec queue.
+# WAVEEND carries a synthetic s_endpgm and is dropped; s_delay_alu/s_wait_alu emit no token at all.
+# pc and both times are made relative to the first entry: the absolute pc depends on where the elf
+# put .text, and the absolute time depends on when tracing armed relative to dispatch.
+def sram_scope(blob:bytes, lib:bytes, arch:str, simd:int=0) -> list[tuple[int, int|None, int, str]]:
+  out: list[list] = []
+  pending: dict[str, list[int]] = {}
+  for p, info in map_insts(blob, lib, arch, simd):
+    if isinstance(p, (ALUEXEC, VMEMEXEC)):
+      for q in (["VALU", "SALU"] if (n:=p.src.name) == "VALU_SALU" else [n]):
+        if pending.get(q): out[pending[q].pop(0)][1] = p._time
+      continue
+    if info is None or info.inst.op_name == "S_ENDPGM": continue
+    if isinstance(p, (INST, VALUINST)):
+      name = p.op.name if isinstance(p, INST) else "VALUINST"
+      if (et:=_DISPATCH_TO_EXEC.get(name.replace("OTHER_", "").split("_")[0])) is not None:
+        pending.setdefault(et, []).append(len(out))
+    out.append([p._time, None, info.pc, info.inst.op_name])
+  if not out: return []
+  t0, pc0 = out[0][0], out[0][2]
+  return [(t - t0, None if e is None else e - t0, pc - pc0, op) for t, e, pc, op in out]
+
+# SNAPSHOT is periodic hardware state with no decoded meaning and no token_exclude bit to turn it
+# off, so it is dropped here, as is the untimed LAYOUT_HEADER. times are shifted to start at the
+# first packet so hw and emu line up. NOSKIP=1 still shows the TS_DELTA/NOP padding.
+def dump_trace(label:str, raw:tuple):
+  pkts = [(p, i) for p, i in map_insts(*raw) if not isinstance(p, SNAPSHOT)]
+  t0 = next((p._time for p, i in pkts if i is not None), 0)  # first real instruction
+  for p, _ in pkts:
+    if not isinstance(p, LAYOUT_HEADER): p._time -= t0  # the header is untimed, leave it at 0
+  print(f"\n  ===== full {label} sqtt trace, t0 relative =====")
+  print_packets(pkts)
+
+def insts_of(proj): return [(pc, op) for _, _, pc, op in proj]
+def times_of(proj): return [t for t, _, _, _ in proj]
+def execs_of(proj): return [e for _, e, _, _ in proj]
+
+
