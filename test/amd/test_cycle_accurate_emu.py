@@ -4,7 +4,7 @@ from tinygrad.device import Compiled
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.helpers import Context
 from tinygrad.renderer.amd.dsl import s, v
-from tinygrad.renderer.amd.sqtt import map_insts, print_packets, INST, VALUINST, ALUEXEC, VMEMEXEC, SNAPSHOT
+from tinygrad.renderer.amd.sqtt import map_insts, print_packets, INST, VALUINST, ALUEXEC, VMEMEXEC, SNAPSHOT, LAYOUT_HEADER
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 import tinygrad.runtime.ops_amd  # noqa: F401  registers the SQTT_* ContextVars
 
@@ -121,10 +121,15 @@ def sram_scope(blob:bytes, lib:bytes, arch:str, simd:int=0) -> list[tuple[int, i
   return [(t - t0, None if e is None else e - t0, pc - pc0, op) for t, e, pc, op in out]
 
 # SNAPSHOT is periodic hardware state with no decoded meaning and no token_exclude bit to turn it
-# off, so it is dropped here. NOSKIP=1 still shows the TS_DELTA/NOP padding print_packets hides.
+# off, so it is dropped here, as is the untimed LAYOUT_HEADER. times are shifted to start at the
+# first packet so hw and emu line up. NOSKIP=1 still shows the TS_DELTA/NOP padding.
 def dump_trace(label:str, raw:tuple):
-  print(f"\n  ===== full {label} sqtt trace =====")
-  print_packets((p, i) for p, i in map_insts(*raw) if not isinstance(p, SNAPSHOT))
+  pkts = [(p, i) for p, i in map_insts(*raw) if not isinstance(p, SNAPSHOT)]
+  t0 = next((p._time for p, i in pkts if i is not None), 0)  # first real instruction
+  for p, _ in pkts:
+    if not isinstance(p, LAYOUT_HEADER): p._time -= t0  # the header is untimed, leave it at 0
+  print(f"\n  ===== full {label} sqtt trace, t0 relative =====")
+  print_packets(pkts)
 
 def insts_of(proj): return [(pc, op) for _, _, pc, op in proj]
 def times_of(proj): return [t for t, _, _, _ in proj]
