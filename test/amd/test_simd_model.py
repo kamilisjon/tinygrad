@@ -18,7 +18,12 @@ from tinygrad.renderer.amd.dsl import s
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 from test.amd.helpers import TARGET_TO_ARCH, capture_runs, project, times_of, execs_of, insts_of
 
-QUEUE_CYCLES = 4  # cycles between dispatch and exec when the queue is empty and the worker is idle
+# dispatch->exec with an empty queue and an idle worker is not one number: the first instruction of
+# a wave costs more than a later one. measured on gfx1102 with s_add_i32.
+FIRST_INST_CYCLES = 4  # first instruction of the wave
+QUEUE_CYCLES = 2       # any later instruction
+# open: an 8 instruction chain starting with s_mov_b32 showed 2, not 4, for its first instruction, so
+# the extra cost is not paid by every opcode. unexplained.
 REF = "/tmp/tinygrad_sqtt_ref.pkl"  # hardware traces captured here, replayed by test_cycle_accurate_emu
 KERNELS: dict = {}  # name -> builder, so the emulator test can rerun exactly what hardware ran
 
@@ -49,18 +54,20 @@ custom_salu_after_idle = _kernel("custom_salu_after_idle", [
 
 @unittest.skipUnless(Device.DEFAULT == "AMD", "requires AMD device")
 class TestSIMDModel(unittest.TestCase):
-  def setUp(self):
-    if "MOCK" in type(Device["AMD"].iface).__name__: self.skipTest("needs real hardware, not the emulator")
-    if TARGET_TO_ARCH[Device["AMD"].arch] != "rdna3": self.skipTest("only rdna3")
-
+  # open the device once: a failed open leaves its flock held, so retrying per test buries the real
+  # error under a lock error from the next attempt
   @classmethod
   def setUpClass(cls):
+    if "MOCK" in type(Device["AMD"].iface).__name__: raise unittest.SkipTest("needs real hardware, not the emulator")
+    if TARGET_TO_ARCH[Device["AMD"].arch] != "rdna3": raise unittest.SkipTest("only rdna3")
     if os.path.exists(REF): os.remove(REF)  # a run starts a fresh set of references
 
   # capture on hardware, record the raw trace for the emulator test, and return the projection
   def _capture(self, fxn, kname):
     projs, raw, lib, arch, simd = capture_runs(fxn, kname)
-    ref = pickle.load(open(REF, "rb")) if os.path.exists(REF) else {}
+    ref = {}
+    if os.path.exists(REF):
+      with open(REF, "rb") as f: ref = pickle.load(f)
     ref[kname] = {"runs":raw, "lib":lib, "arch":arch, "simd_sel":simd}
     with open(REF, "wb") as f: pickle.dump(ref, f)
     print(f"\n  {kname}: " + ", ".join(f"{op}@{t}->{e}" for t, e, _, op in projs[0]))
@@ -69,22 +76,25 @@ class TestSIMDModel(unittest.TestCase):
   def _salu_gaps(self, fxn, kname):
     return [(t, e) for t, e, _, op in self._capture(fxn, kname) if op.startswith("S_ADD")]
 
-  # refuted by: any gap that is not QUEUE_CYCLES
-  def test_queue_transit_on_empty_queue(self):
+  # refuted by: a gap that is not FIRST_INST_CYCLES
+  def test_first_instruction_transit(self):
     gaps = self._salu_gaps(custom_salu_single, "custom_salu_single")
     self.assertEqual(len(gaps), 1)
     t, e = gaps[0]
     self.assertIsNotNone(e, "no ALUEXEC packet, cannot measure queue transit")
-    self.assertEqual(e - t, QUEUE_CYCLES)
+    self.assertEqual(e - t, FIRST_INST_CYCLES)
 
-  # refuted by: the second gap differing from the first, which would mean the 4 cycles are wave
-  # launch cost rather than queue transit
-  def test_queue_transit_is_not_wave_launch(self):
+  # the second s_add is dispatched long after the SALU queue drained, so it measures transit without
+  # whatever the first instruction of a wave pays for.
+  # refuted by: the second gap equalling the first (transit would then be one constant), or the two
+  # gaps differing from these values at all
+  def test_steady_state_transit(self):
     gaps = self._salu_gaps(custom_salu_after_idle, "custom_salu_after_idle")
     self.assertEqual(len(gaps), 2)
     for i, (t, e) in enumerate(gaps):
       self.assertIsNotNone(e, f"s_add {i} has no ALUEXEC packet")
-      self.assertEqual(e - t, QUEUE_CYCLES, f"s_add {i} took {e-t} cycles in the queue, not {QUEUE_CYCLES}")
+    self.assertEqual(gaps[0][1] - gaps[0][0], FIRST_INST_CYCLES, "first s_add")
+    self.assertEqual(gaps[1][1] - gaps[1][0], QUEUE_CYCLES, "second s_add, queue already drained")
 
 if __name__ == "__main__":
   unittest.main()
