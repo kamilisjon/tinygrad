@@ -79,7 +79,7 @@ class TestSIMDModel(unittest.TestCase):
       if emu is None: print("    " + colored(f"emu  no trace: {err}", "red"))
       ref_rows = {}
       for b, proj in enumerate(projs + ([emu] if emu else [])):
-        label = "emu" if b == len(projs) else f"#{b}"
+        is_emu = b == len(projs)
         blk = [(t, e) for t, e, _, _op in proj]
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
         gaps = [y[1]-x[1] for x, y in zip(blk, blk[1:]) if x[1] is not None and y[1] is not None]
@@ -88,8 +88,8 @@ class TestSIMDModel(unittest.TestCase):
                 "dispatch_to_exec": [None if e is None else e - t for t, e in blk],
                 "dispatch gaps": disp, "exec gaps": gaps}
         if b == 0: ref_rows = rows
-        print(f"    {label if label != 'emu' else colored(label, 'green' if ok else 'red')}")
-        for k, v in rows.items(): print(f"        {k:<16} " + (str(v) if label != "emu" else _diff_row(v, ref_rows[k])))
+        print("    " + (colored("emu", "green" if ok else "red") if is_emu else f"#{b}"))
+        for k, v in rows.items(): print(f"        {k:<16} " + (_diff_row(v, ref_rows[k]) if is_emu else str(v)))
     self.assertFalse(fails, f"{len(fails)} opcodes disagree with the emulator or with themselves:\n" + "\n".join(fails))
 
   def test_sop1(self): self._sweep(e3.SOP1Op)
