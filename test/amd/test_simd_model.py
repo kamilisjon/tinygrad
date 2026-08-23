@@ -183,7 +183,9 @@ class TestSIMDModel(unittest.TestCase):
       # where the model lives, so the sweep does not restate it here: hardware and emulator either
       # emit the same trace or they do not.
       try: emu = sram_scope(capture_emu(block), lib, arch, 0)
-      except Exception as e: emu, err = None, repr(e)  # no pcode for this opcode, or it faulted
+      except Exception as e:  # no pcode for this opcode, or it faulted
+        emu, err = None, repr(e)
+        print("    " + colored(f"emu  no trace: {err}", "red"))
       seen, want, ref_rows = set(), salu_timing(name), {}
       for b, proj in enumerate(projs + ([emu] if emu else [])):
         label = "emu" if b == len(projs) else f"#{b}"
