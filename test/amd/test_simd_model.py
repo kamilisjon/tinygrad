@@ -43,7 +43,7 @@ _EXTRA_READ = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset
 def salu_timing(name:str) -> tuple[int, int]:
   srcs = [w for _f, (_fmt, w, k) in OPERANDS[_SOP_OPS[name]].items() if k.name == "OPR_SSRC"]
   extra, mul = name.startswith(_EXTRA_READ), "_mul" in name
-  interval = 8 if "wrexec" in name else 2 if (mul or srcs == [32, 32]) else 1
+  interval = 2 if (mul or srcs == [32, 32]) else 1
   return 2 + 2*extra + mul, interval
 
 # the sgpr file is banked and two reads landing in the same bank cost one extra cycle. these read
@@ -62,6 +62,20 @@ def salu_timing(name:str) -> tuple[int, int]:
 # case this sweep cannot reach: two *sources* 16 apart, which would say whether the conflict is
 # about reading two sgprs at all or specifically about reading the destination.
 _BANK_CONFLICT = ("s_cmov_b32", "s_cmov_b64", "s_bitset0_b32", "s_bitset0_b64", "s_bitset1_b32", "s_bitset1_b64")
+
+# these read EXEC and write it back (EXEC, D = ~S0 & EXEC), so consecutive ones are a serial
+# dependency chain no matter which registers we hand them: EXEC is an implicit operand on both
+# sides. what they measure is therefore a dependent latency, 8 cycles, not an initiation interval
+# like every other entry in salu_timing, so they do not belong in the same sweep.
+# TODO: measure the 8 properly, with a kernel built for a chain rather than for independent repeats.
+# s_mov_b32 exec_lo, s[4+i] writes EXEC without reading it, so it separates the cost of writing EXEC
+# from the cost of chaining on it. filling the chain with independent work (wrexec then 7 s_mov)
+# says whether the 8 is a latency the SALU can hide or a stall that blocks the pipe, which are
+# different emulator models with identical evidence so far.
+# TODO: explain the ramp. the first ~9 run at 2 before it settles to 8, which a pure serial
+# dependency does not predict. seeding s[4] with 0 keeps EXEC constant and tells whether the ramp is
+# structural or a value-dependent EXECZ effect.
+_EXEC_CHAIN = ("s_and_not0_wrexec_b32", "s_and_not0_wrexec_b64", "s_and_not1_wrexec_b32", "s_and_not1_wrexec_b64")
 
 REF = "/tmp/tinygrad_sqtt_ref.pkl"  # hardware traces captured here, replayed by test_cycle_accurate_emu
 KERNELS: dict = {}  # name -> builder, so the emulator test can rerun exactly what hardware ran
@@ -137,7 +151,7 @@ def _sweep_inst(name:str, i:int):
 # also require tinygrad to decode it back, since amd_decode must disassemble the whole kernel.
 def _sweep_ok(name:str, target:str) -> bool:
   if OPERANDS.get(_SOP_OPS[name]) is None or any(u in name.upper() for u in _UNSAFE): return False
-  if name in _BANK_CONFLICT: return False
+  if name in _BANK_CONFLICT or name in _EXEC_CHAIN: return False
   if not hasattr(r3, name): return False
   try:
     inst = _sweep_inst(name, 0)
