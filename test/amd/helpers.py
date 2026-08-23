@@ -137,7 +137,7 @@ def llvm_filter_valid_asm(tests:list[tuple[str, bytes]], mcpu:str, mattr:str) ->
   # Invalid instructions produce 0 bytes; also filter where LLVM roundtrip doesn't match original
   return [(asm, data) for (asm, data), chunk in zip(tests, results) if len(chunk) > 0 and chunk == data]
 
-# ── SQTT capture and projection, shared by test_simd_model and test_cycle_accurate_emu ──
+# ── SQTT capture and projection ──
 
 # link a trace to the exact binary that produced it via ProfileSQTTEvent.kern -> ProfileProgramEvent.tag,
 # the way viz and test_sqttmap do. matching on name alone can pick a stale build of an edited kernel.
@@ -249,3 +249,16 @@ def times_of(proj): return [t for t, _, _, _ in proj]
 def execs_of(proj): return [e for _, e, _, _ in proj]
 
 
+
+# run the same instructions on the emulator, in this process, whatever device is selected. the
+# emulator is a plain function over host memory, not a tinygrad backend, so it does not need
+# DEV=MOCKKFD and can be called while a real GPU is open. tracing is gated on PROFILE alone.
+def capture_emu(insts:list, n_lanes:int=32) -> bytes:
+  import test.mockgpu.amd.emu as emu
+  code = b"".join(i.to_bytes() for i in insts)
+  buf = (ctypes.c_char * len(code)).from_buffer_copy(code)
+  args = (ctypes.c_uint64 * 1)(0)  # the kernels compared here touch no memory
+  emu.sqtt_traces.clear()
+  assert emu.run_asm(ctypes.addressof(buf), len(code), 1, 1, 1, n_lanes, 1, 1, ctypes.addressof(args)) == 0, "emulator rejected the kernel"
+  assert emu.sqtt_traces, "emulator produced no SQTT trace, is PROFILE=1 set?"
+  return emu.sqtt_traces[0]

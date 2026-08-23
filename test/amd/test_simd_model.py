@@ -11,7 +11,7 @@
 #   dispatch  the wave put the instruction in the queue      SQTT INST / VALUINST packet
 #   exec      the worker took it out and started on it       SQTT ALUEXEC / VMEMEXEC packet
 # There is no completion event, so nothing here can measure how long an instruction runs for.
-import unittest, os, pickle
+import unittest
 from tinygrad import Device
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.renderer.amd.dsl import s, OPERANDS
@@ -20,7 +20,8 @@ import tinygrad.runtime.autogen.amd.rdna3.ins as r3
 import tinygrad.runtime.autogen.amd.rdna3.enum as e3
 from tinygrad.renderer.amd import decode_inst
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
-from test.amd.helpers import TARGET_TO_ARCH, llvm_disasm, get_mattr, capture_runs, project, times_of, execs_of, insts_of
+from test.amd.helpers import TARGET_TO_ARCH, llvm_disasm, get_mattr, capture_runs, capture_emu, sram_scope
+from test.amd.helpers import times_of, execs_of, insts_of
 
 # dispatch_to_exec is the cycles from an instruction being enqueued to its ALUEXEC packet, measured
 # with an empty queue and an idle worker. it is not one number: something ahead of the worker costs
@@ -81,17 +82,11 @@ _BANK_CONFLICT = ("s_cmov_b32", "s_cmov_b64", "s_bitset0_b32", "s_bitset0_b64", 
 # structural or a value-dependent EXECZ effect.
 _EXEC_CHAIN = ("s_and_not0_wrexec_b32", "s_and_not0_wrexec_b64", "s_and_not1_wrexec_b32", "s_and_not1_wrexec_b64")
 
-REF = "/tmp/tinygrad_sqtt_ref.pkl"  # hardware traces captured here, replayed by test_cycle_accurate_emu
-KERNELS: dict = {}  # name -> builder, so the emulator test can rerun exactly what hardware ran
-
-# register=False for kernels that only make sense on hardware, so test_cycle_accurate_emu does not
-# try to replay them: the sweep covers opcodes the emulator has no pcode for
-def _kernel(name:str, insts:list, register:bool=True):
+def _kernel(name:str, insts:list):
   def fxn(A:UOp) -> UOp:
     threads, wg = UOp.special(32, "lidx0"), UOp.special(1, "gidx0")
     sink = UOp.sink(A.flatten().base, threads, wg, arg=KernelInfo(name))
     return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=x) for x in insts]))))
-  if register: KERNELS[name] = fxn
   return fxn
 
 # one SALU instruction, nothing before it. the queue is empty because the wave just started, so this
@@ -175,16 +170,10 @@ class TestSIMDModel(unittest.TestCase):
   def setUpClass(cls):
     if "MOCK" in type(Device["AMD"].iface).__name__: raise unittest.SkipTest("needs real hardware, not the emulator")
     if TARGET_TO_ARCH[Device["AMD"].arch] != "rdna3": raise unittest.SkipTest("only rdna3")
-    if os.path.exists(REF): os.remove(REF)  # a run starts a fresh set of references
 
-  # capture on hardware, record the raw trace for the emulator test, and return the projection
+  # capture on hardware and return the projection
   def _capture(self, fxn, kname):
     projs, raw, lib, arch, simd = capture_runs(fxn, kname)
-    ref = {}
-    if os.path.exists(REF):
-      with open(REF, "rb") as f: ref = pickle.load(f)
-    ref[kname] = {"runs":raw, "lib":lib, "arch":arch, "simd_sel":simd}
-    with open(REF, "wb") as f: pickle.dump(ref, f)
     self.raw = (raw[0][0], lib, arch, simd)
     print(f"\n  {kname}: " + ", ".join(f"{op}@{t}->{e}" for t, e, _, op in projs[0]))
     return projs[0]
@@ -226,16 +215,22 @@ class TestSIMDModel(unittest.TestCase):
       # TODO: explain it. a cold first dispatch would slow every opcode, not five of them, so the
       # cause is something that varies per run. compare the full packet stream of trial 0 against
       # trial 1 for one affected opcode.
-      kname = f"custom_salu_{name}"
-      kernel = _kernel(kname, _sweep_block(name) + [s_endpgm()], register=False)
-      projs, raw, lib, arch, simd = capture_runs(kernel, kname, SWEEP_BLOCKS)
+      kname, block = f"custom_salu_{name}", _sweep_block(name) + [s_endpgm()]
+      projs, raw, lib, arch, simd = capture_runs(_kernel(kname, block), kname, SWEEP_BLOCKS)
       n_exec = sum(isinstance(p, ALUEXEC) for p, _ in map_insts(raw[0][0], lib, arch, simd))
       print(f"\n  **** {name}" + (f"   <- {n_exec} ALUEXEC for {SWEEP_REPEATS} instructions, pairing unreliable"
                                    if n_exec != SWEEP_REPEATS else ""))
+      # the emulator runs the same instructions in this process and joins as the last trial. it is
+      # where the model lives, so the sweep does not restate it here: hardware and emulator either
+      # emit the same trace or they do not.
+      try: emu = sram_scope(capture_emu(block), lib, arch, 0)
+      except Exception as e: emu, err = None, repr(e)  # no pcode for this opcode, or it faulted
       seen, want = set(), salu_timing(name)
-      for b, proj in enumerate(projs):
+      for b, proj in enumerate(projs + ([emu] if emu else [])):
+        label = "emu" if b == len(projs) else f"#{b}"
         blk = [(t, e) for t, e, _, _op in proj]
-        self.assertEqual(len(blk), SWEEP_REPEATS, f"{name} trial {b}: unexpected instruction count")
+        # the emulator's own count is checked below, against hardware, not against the model
+        if label != "emu": self.assertEqual(len(blk), SWEEP_REPEATS, f"{name} {label}: unexpected instruction count")
         dispatch_to_exec = None if blk[0][1] is None else blk[0][1] - blk[0][0]
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
         gaps = [y[1]-x[1] for x, y in zip(blk, blk[1:]) if x[1] is not None and y[1] is not None]
@@ -243,11 +238,11 @@ class TestSIMDModel(unittest.TestCase):
         # interval off the tail rather than off the ramp.
         tail = gaps[SWEEP_RAMP:]
         interval = max(set(tail), key=tail.count) if tail else None
-        seen.add((dispatch_to_exec, interval))
+        if label != "emu": seen.add((dispatch_to_exec, interval))
         # absolute cycles first, then the gaps between them. dispatch_to_exec is the vertical
         # distance between the two rows, so it is the first exec time once both are anchored on 0.
         t0 = blk[0][0]
-        print(f"    #{b}")
+        print(f"    {label}")
         print(f"        dispatch {[t - t0 for t, _ in blk]}")
         print(f"        exec     {[None if e is None else e - t0 for _, e in blk]}")
         print(f"        d to e   {[None if e is None else e - t for t, e in blk]}")
@@ -255,7 +250,12 @@ class TestSIMDModel(unittest.TestCase):
         print(f"        e gaps   {gaps}")
       if len(seen) > 1: fails.append(f"{name}: unstable across trials, {sorted(seen)}")
       elif seen != {want}: fails.append(f"{name}: {seen.pop()}, expected {want}")
-    self.assertFalse(fails, f"{len(fails)} opcodes disagree with salu_timing():\n" + "\n".join(fails))
+      # trial 0 is the reference: whatever hardware did, the emulator has to reproduce exactly
+      if emu is None: fails.append(f"{name}: emulator produced no trace, {err}")
+      elif insts_of(emu) != insts_of(projs[0]): fails.append(f"{name}: emulator executed different instructions")
+      elif (times_of(emu), execs_of(emu)) != (times_of(projs[0]), execs_of(projs[0])):
+        fails.append(f"{name}: emulator timing differs from hardware")
+    self.assertFalse(fails, f"{len(fails)} opcodes disagree with salu_timing() or with the emulator:\n" + "\n".join(fails))
 
 if __name__ == "__main__":
   unittest.main()
