@@ -1,11 +1,11 @@
 # SQTT trace encoder for the emulator (the decoder lives in tinygrad/renderer/amd/sqtt.py).
 from __future__ import annotations
 from tinygrad.renderer.amd.dsl import Inst
-from tinygrad.renderer.amd.sqtt import (_build_decode_tables, PACKET_TYPES_RDNA3, PacketType, InstOp, AluSrc, MemSrc, DISPATCH_TO_EXEC,
+from tinygrad.renderer.amd.sqtt import (_DECODE_INFO_RDNA3, PacketType, InstOp, AluSrc, MemSrc, DISPATCH_TO_EXEC,
                                         LAYOUT_HEADER, WAVESTART, WAVEEND, INST, IMMEDIATE, VALUINST, ALUEXEC, VMEMEXEC,
                                         TS_DELTA_SHORT)
 
-_NIB_COUNTS = {cls: nc for _, (cls, nc, *_) in _build_decode_tables(PACKET_TYPES_RDNA3)[0].items()}
+_NIB_COUNTS = {cls: nc for _, (cls, nc, *_) in _DECODE_INFO_RDNA3.items()}
 
 def _emit_nibbles(nibbles: list[int], pkt_cls: type[PacketType], **kwargs):
   raw = pkt_cls.encoding.default
@@ -13,9 +13,8 @@ def _emit_nibbles(nibbles: list[int], pkt_cls: type[PacketType], **kwargs):
   nibbles.extend((raw >> (i * 4)) & 0xF for i in range(_NIB_COUNTS[pkt_cls]))
 
 def _emit_at(nibbles: list[int], last: int, pkt_cls: type[PacketType], cycle: int, **kwargs) -> int:
-  rem = cycle - last
-  assert rem >= 0, f"cycle went backwards: {cycle} < {last}"
-  while rem > (m:=pkt_cls.delta.mask):
+  assert (rem:=cycle - last) >= 0, f"cycle went backwards: {cycle} < {last}"
+  while rem > pkt_cls.delta.mask:
     _emit_nibbles(nibbles, TS_DELTA_SHORT, delta=(step:=min(19, rem)) - 4)
     rem -= step
   _emit_nibbles(nibbles, pkt_cls, delta=rem, **kwargs)
@@ -130,9 +129,9 @@ def make_encoder():
     _emit_nibbles(nibbles, LAYOUT_HEADER, layout=3, sel_a=6)
     last = 0
     for cycle, _, pkt_cls, kw in sorted(events): last = _emit_at(nibbles, last, pkt_cls, cycle, **kw)
-    while len(nibbles) % 2 != 0: nibbles.append(0)
+    if len(nibbles) % 2: nibbles.append(0)
     nibbles.extend([0] * 32)
-    while len(nibbles) % 64 != 0: nibbles.append(0)
-    return bytes(nibbles[i] | ((nibbles[i + 1] if i + 1 < len(nibbles) else 0) << 4) for i in range(0, len(nibbles), 2))
+    while len(nibbles) % 64: nibbles.append(0)
+    return bytes(nibbles[i] | (nibbles[i+1] << 4) for i in range(0, len(nibbles), 2))
 
   return emit, emit_exec, finish, finalize
