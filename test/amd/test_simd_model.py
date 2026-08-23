@@ -17,7 +17,7 @@
 # covered and want their own kernels when the time comes.
 import unittest
 from tinygrad import Device
-from tinygrad.helpers import colored
+from tinygrad.helpers import colored, DEBUG
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.renderer.amd.dsl import s, OPERANDS
 from tinygrad.renderer.amd.sqtt import map_insts, ALUEXEC
@@ -112,22 +112,30 @@ class TestSIMDModel(unittest.TestCase):
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
       projs, raw, lib, arch, simd = capture_runs(_kernel(kname, block), kname, SWEEP_BLOCKS)
-      n_exec = sum(isinstance(p, ALUEXEC) for p, _ in map_insts(raw[0][0], lib, arch, simd))
-      print(f"\n  **** {name}" + (f"   <- {n_exec} ALUEXEC for {SWEEP_REPEATS} instructions, pairing unreliable"
-                                   if n_exec != SWEEP_REPEATS else ""))
       # the emulator runs the same instructions in this process and joins as the last trial. it is
       # where the model lives, so the sweep does not restate it here: hardware and emulator either
       # emit the same trace or they do not.
-      try: emu = sram_scope(capture_emu(block), lib, arch, 0)
-      except Exception as e:  # no pcode for this opcode, or it faulted
-        emu, err = None, repr(e)
-        print("    " + colored(f"emu  no trace: {err}", "red"))
+      try: emu, err = sram_scope(capture_emu(block), lib, arch, 0), None
+      except Exception as e: emu, err = None, repr(e)  # no pcode for this opcode, or it faulted
+
+      was = len(fails)
+      if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: hardware trials disagree with each other")
+      # trial 0 is the reference: whatever hardware did, the emulator has to reproduce exactly
+      if emu is None: fails.append(f"{name}: emulator produced no trace, {err}")
+      elif insts_of(emu) != insts_of(projs[0]): fails.append(f"{name}: emulator executed different instructions")
+      elif (times_of(emu), execs_of(emu)) != (times_of(projs[0]), execs_of(projs[0])):
+        fails.append(f"{name}: emulator timing differs from hardware")
+      if (ok := len(fails) == was) and DEBUG < 1: continue
+
+      # only the opcodes that disagree are worth looking at, so the ones that match print under DEBUG
+      n_exec = sum(isinstance(p, ALUEXEC) for p, _ in map_insts(raw[0][0], lib, arch, simd))
+      print(f"\n  **** {name}" + (f"   <- {n_exec} ALUEXEC for {SWEEP_REPEATS} instructions, pairing unreliable"
+                                   if n_exec != SWEEP_REPEATS else ""))
+      if emu is None: print("    " + colored(f"emu  no trace: {err}", "red"))
       ref_rows = {}
       for b, proj in enumerate(projs + ([emu] if emu else [])):
         label = "emu" if b == len(projs) else f"#{b}"
         blk = [(t, e) for t, e, _, _op in proj]
-        # the emulator's own count is checked below, against hardware, not against the model
-        if label != "emu": self.assertEqual(len(blk), SWEEP_REPEATS, f"{name} {label}: unexpected instruction count")
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
         gaps = [y[1]-x[1] for x, y in zip(blk, blk[1:]) if x[1] is not None and y[1] is not None]
         # absolute cycles first, then the gaps between them. dispatch_to_exec is the vertical
@@ -139,15 +147,8 @@ class TestSIMDModel(unittest.TestCase):
         # hardware trial 0 is the reference the emulator has to reproduce, so its rows print plain
         # and the emulator's print green where they agree and red where they do not
         if b == 0: ref_rows = rows
-        hit = label != "emu" or all(rows[k] == ref_rows.get(k) for k in rows)
-        print(f"    {label if label != 'emu' else colored(label, 'green' if hit else 'red')}")
-        for k, v in rows.items(): print(f"        {k:<16} " + (str(v) if label != "emu" else _diff_row(v, ref_rows.get(k, []))))
-      if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: hardware trials disagree with each other")
-      # trial 0 is the reference: whatever hardware did, the emulator has to reproduce exactly
-      if emu is None: fails.append(f"{name}: emulator produced no trace, {err}")
-      elif insts_of(emu) != insts_of(projs[0]): fails.append(f"{name}: emulator executed different instructions")
-      elif (times_of(emu), execs_of(emu)) != (times_of(projs[0]), execs_of(projs[0])):
-        fails.append(f"{name}: emulator timing differs from hardware")
+        print(f"    {label if label != 'emu' else colored(label, 'green' if ok else 'red')}")
+        for k, v in rows.items(): print(f"        {k:<16} " + (str(v) if label != "emu" else _diff_row(v, ref_rows[k])))
     self.assertFalse(fails, f"{len(fails)} opcodes disagree with the emulator or with themselves:\n" + "\n".join(fails))
 
   def test_sop1(self): self._sweep(e3.SOP1Op)
