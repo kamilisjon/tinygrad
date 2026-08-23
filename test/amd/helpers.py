@@ -177,15 +177,3 @@ def sram_scope(blob:bytes, lib:bytes, arch:str) -> list[tuple[int, int|None, int
   if not out: return []
   t0, pc0 = out[0][0], out[0][2]
   return [(t - t0, None if e is None else e - t0, pc - pc0, op) for t, e, pc, op in out]
-
-
-
-def capture_emu(insts:list, n_lanes:int=32) -> bytes:
-  import test.mockgpu.amd.emu as emu
-  code = b"".join(i.to_bytes() for i in insts)
-  buf = (ctypes.c_char * len(code)).from_buffer_copy(code)
-  args = (ctypes.c_uint64 * 1)(0)
-  emu.sqtt_traces.clear()
-  assert emu.run_asm(ctypes.addressof(buf), len(code), 1, 1, 1, n_lanes, 1, 1, ctypes.addressof(args)) == 0, "emulator rejected the kernel"
-  assert emu.sqtt_traces, "emulator produced no SQTT trace, is PROFILE=1 set?"
-  return emu.sqtt_traces[0]

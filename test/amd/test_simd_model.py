@@ -7,7 +7,8 @@ import tinygrad.runtime.autogen.amd.rdna3.ins as r3
 import tinygrad.runtime.autogen.amd.rdna3.enum as e3
 from tinygrad.renderer.amd import decode_inst
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
-from test.amd.helpers import TARGET_TO_ARCH, capture_runs, capture_emu, sram_scope
+from test.amd.helpers import TARGET_TO_ARCH, capture_runs, sram_scope
+import ctypes, test.mockgpu.amd.emu as emu
 
 assert "MOCK" not in type(Device["AMD"].iface).__name__, "needs real hardware, the emulator is under test"
 assert TARGET_TO_ARCH[Device["AMD"].arch] == "rdna3", "only rdna3"
@@ -62,15 +63,20 @@ class TestSIMDModel(unittest.TestCase):
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
       projs, lib, arch = capture_runs(_kernel(kname, block), SWEEP_BLOCKS)
-      emu = sram_scope(capture_emu(block), lib, arch)
+      code = b"".join(i.to_bytes() for i in block)
+      buf, args = (ctypes.c_char * len(code)).from_buffer_copy(code), (ctypes.c_uint64 * 1)(0)
+      emu.sqtt_traces.clear()
+      assert emu.run_asm(ctypes.addressof(buf), len(code), 1, 1, 1, 32, 1, 1, ctypes.addressof(args)) == 0, "emulator rejected the kernel"
+      assert emu.sqtt_traces, "emulator produced no SQTT trace, is PROFILE=1 set?"
+      emu_proj = sram_scope(emu.sqtt_traces[0], lib, arch)
       was = len(fails)
       if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: hardware trials disagree with each other")
-      if emu != projs[0]:
-        what = "instructions" if [r[2:] for r in emu] != [r[2:] for r in projs[0]] else "timing"
+      if emu_proj != projs[0]:
+        what = "instructions" if [r[2:] for r in emu_proj] != [r[2:] for r in projs[0]] else "timing"
         fails.append(f"{name}: emulator {what} differs from hardware")
       if (ok := len(fails) == was) and DEBUG < 1: continue
       print(f"\n  **** {name}")
-      for b, proj in enumerate(projs + [emu]):
+      for b, proj in enumerate(projs + [emu_proj]):
         is_emu = b == len(projs)
         blk = [(t, e) for t, e, _, _op in proj]
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
