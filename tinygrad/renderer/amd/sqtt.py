@@ -651,13 +651,14 @@ class InstructionInfo:
   wave: int
   inst: Inst
 
-def map_insts(data:bytes, lib:bytes, target:str, simd:int=0) -> Iterator[tuple[PacketType, InstructionInfo|None]]:
+def map_insts(data:bytes, lib:bytes, target:str) -> Iterator[tuple[PacketType, InstructionInfo|None]]:
   """maps SQTT packets to instructions, yields (packet, instruction_info or None)"""
   # map pcs to insts
   from tinygrad.viz.serve import amd_decode
   pc_map = amd_decode(lib, target)
   wave_pc:dict[int, int] = {}
-  def simd_select(p) -> bool: return getattr(p, "cu", 0) == 0 and getattr(p, "simd", simd) == simd
+  # only processing packets on one [CU, SIMD] unit
+  def simd_select(p) -> bool: return getattr(p, "cu", 0) == 0 and getattr(p, "simd", 0) == 0
   for p in decode(data):
     if not simd_select(p): continue
     if isinstance(p, (WAVESTART, WAVESTART_RDNA4, CDNA_WAVESTART)):
@@ -669,15 +670,12 @@ def map_insts(data:bytes, lib:bytes, target:str, simd:int=0) -> Iterator[tuple[P
     elif isinstance(p, IMMEDIATE_MASK):
       # immediate mask may yield multiple times per packet
       for wave in range(16):
-        if p.mask & (1 << wave) and wave in wave_pc:
+        if p.mask & (1 << wave):
           inst = pc_map[pc:=wave_pc[wave]]
           wave_pc[wave] += inst.size()
           yield (p, InstructionInfo(pc, wave, inst))
     # map INST events on this SIMD to the program counter, we know the waves
     elif isinstance(p, (VALUINST, INST, INST_RDNA4, IMMEDIATE)) and not (isinstance(p, (INST, INST_RDNA4)) and p.op.name.startswith("OTHER_")):
-      if p.wave not in wave_pc:
-        yield (p, None)
-        continue
       inst = pc_map[pc:=wave_pc[p.wave]]
       # s_delay_alu, s_wait_alu and s_barrier_wait instructions are skipped
       while (inst_op:=getattr(inst, 'op_name', '')) in {"S_DELAY_ALU", "S_WAIT_ALU", "S_BARRIER_WAIT"}:
