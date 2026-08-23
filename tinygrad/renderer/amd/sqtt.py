@@ -39,6 +39,9 @@ def add_other_simd(cls:type[Enum], ranges:list[tuple[str, int, int, int]]) -> No
 DISPATCH_TO_EXEC = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
                     "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
 
+def exec_queue_of(name:str) -> str|None:
+  return DISPATCH_TO_EXEC.get(name.replace("OTHER_", "").split("_")[0])
+
 class InstOp(Enum):
   """SQTT instruction operation types for RDNA3 (gfx1100).
 
