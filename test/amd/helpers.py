@@ -142,16 +142,17 @@ def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
   arch, sel, projs, lib = Device["AMD"].arch, None, [], None
   for _ in range(max_dispatch):
     if len(projs) == n_runs: break
-    for simd_sel in (range(4) if sel is None else [sel]):
+    for simd_sel in (range(2) if sel is None else [sel]):
       start = len(Compiled.profile_events)
       with Context(SQTT_LIMIT_SE=1, SQTT_ITRACE_SE_MASK=1, SQTT_SIMD_SEL=simd_sel):
         Tensor.custom_kernel(a, fxn=fxn)[0].realize()
       Device[Device.DEFAULT].synchronize()
       evs = [e for e in Compiled.profile_events[start:] if type(e).__name__ == "ProfileSQTTEvent" and e.itrace]
       assert evs, "hardware produced no instruction-traced SQTT events, is SQTT=1 set?"
-      prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
-      assert (prg:=prgs.get(evs[0].kern)) is not None and prg.lib, f"no ProfileProgramEvent tagged {evs[0].kern}, is PROFILE=1 set?"
-      lib = prg.lib
+      if lib is None:
+        prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
+        assert (prg:=prgs.get(evs[0].kern)) is not None and prg.lib, f"no ProfileProgramEvent tagged {evs[0].kern}, is PROFILE=1 set?"
+        lib = prg.lib
       if pr:=next((p for e in evs if (p:=sram_scope(e.blob, lib, arch))), None):
         sel = simd_sel
         projs.append(pr)
