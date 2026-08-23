@@ -8,7 +8,6 @@ import tinygrad.runtime.autogen.amd.rdna3.enum as e3
 from tinygrad.renderer.amd import decode_inst
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 from test.amd.helpers import TARGET_TO_ARCH, capture_runs, capture_emu, sram_scope
-from test.amd.helpers import times_of, execs_of, insts_of
 
 assert "MOCK" not in type(Device["AMD"].iface).__name__, "needs real hardware, the emulator is under test"
 assert TARGET_TO_ARCH[Device["AMD"].arch] == "rdna3", "only rdna3"
@@ -66,9 +65,9 @@ class TestSIMDModel(unittest.TestCase):
       emu = sram_scope(capture_emu(block), lib, arch)
       was = len(fails)
       if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: hardware trials disagree with each other")
-      if insts_of(emu) != insts_of(projs[0]): fails.append(f"{name}: emulator executed different instructions")
-      elif (times_of(emu), execs_of(emu)) != (times_of(projs[0]), execs_of(projs[0])):
-        fails.append(f"{name}: emulator timing differs from hardware")
+      if emu != projs[0]:
+        what = "instructions" if [r[2:] for r in emu] != [r[2:] for r in projs[0]] else "timing"
+        fails.append(f"{name}: emulator {what} differs from hardware")
       if (ok := len(fails) == was) and DEBUG < 1: continue
       print(f"\n  **** {name}")
       for b, proj in enumerate(projs + [emu]):

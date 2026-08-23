@@ -179,10 +179,6 @@ def sram_scope(blob:bytes, lib:bytes, arch:str) -> list[tuple[int, int|None, int
   return [(t - t0, None if e is None else e - t0, pc - pc0, op) for t, e, pc, op in out]
 
 
-def insts_of(proj): return [(pc, op) for _, _, pc, op in proj]
-def times_of(proj): return [t for t, _, _, _ in proj]
-def execs_of(proj): return [e for _, e, _, _ in proj]
-
 
 def capture_emu(insts:list, n_lanes:int=32) -> bytes:
   import test.mockgpu.amd.emu as emu
