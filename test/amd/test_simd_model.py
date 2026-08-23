@@ -66,7 +66,7 @@ class TestSIMDModel(unittest.TestCase):
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
       projs, lib, arch = capture_runs(_kernel(kname, block), SWEEP_BLOCKS)
-      try: emu, err = sram_scope(capture_emu(block), lib, arch, 0), None
+      try: emu = sram_scope(capture_emu(block), lib, arch, 0)
       except Exception as e: emu, err = None, repr(e)
       was = len(fails)
       if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: hardware trials disagree with each other")
@@ -77,7 +77,6 @@ class TestSIMDModel(unittest.TestCase):
       if (ok := len(fails) == was) and DEBUG < 1: continue
       print(f"\n  **** {name}")
       if emu is None: print("    " + colored(f"emu  no trace: {err}", "red"))
-      ref_rows = {}
       for b, proj in enumerate(projs + ([emu] if emu else [])):
         is_emu = b == len(projs)
         blk = [(t, e) for t, e, _, _op in proj]
