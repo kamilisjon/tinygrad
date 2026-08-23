@@ -119,7 +119,7 @@ custom_salu_after_idle = _kernel("custom_salu_after_idle", [
 # is on, so 256 bytes = 64 instructions of straight line code run before it catches the prefetcher
 # and stalls ~235 cycles for a real fetch. keep the whole kernel under that and the stall never
 # happens, instead of landing mid block and corrupting whichever repeat it hits.
-SWEEP_REPEATS, SWEEP_BLOCKS, SWEEP_RAMP = 48, 3, 10
+SWEEP_REPEATS, SWEEP_BLOCKS, SWEEP_RAMP = 36, 3, 10
 assert SWEEP_REPEATS + 1 <= 64, "kernel would outrun the prefetcher"
 # sources sit below the destinations and are shared by every repeat. putting them above instead
 # makes the base scale with SWEEP_REPEATS and silently run off the end of the sgpr file. an opcode
@@ -244,9 +244,14 @@ class TestSIMDModel(unittest.TestCase):
         tail = gaps[SWEEP_RAMP:]
         interval = max(set(tail), key=tail.count) if tail else None
         seen.add((transit, interval))
+        # absolute cycles first, then the gaps between them. transit is the vertical distance
+        # between the two rows, so it is the first exec time once both are anchored on dispatch 0.
+        t0 = blk[0][0]
         print(f"    #{b} transit={str(transit):>4} interval={str(interval):>4}")
-        print(f"        dispatch {disp}")
-        print(f"        exec     {gaps}")
+        print(f"        dispatch {[t - t0 for t, _ in blk]}")
+        print(f"        exec     {[None if e is None else e - t0 for _, e in blk]}")
+        print(f"        d gaps   {disp}")
+        print(f"        e gaps   {gaps}")
       want = salu_timing(name)
       if len(seen) > 1: fails.append(f"{name}: unstable across trials, {sorted(seen)}")
       elif seen != {want}: fails.append(f"{name}: {seen.pop()}, expected {want}")
