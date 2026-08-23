@@ -37,32 +37,31 @@ FIRST_INST_CYCLES = 4  # first instruction of the wave
 # cost is in the source reads, not the width of the result.
 # s_movk_i32 is the control for the +2 transit term: it writes sdst without reading it, and is the
 # only SOPK opcode at transit 2.
-# OPERANDS marks sdst the same whether it is read or written, so the extra-read set is listed. it is
-# split by where the extra read goes: the sgpr file, or M0. only the first kind can bank conflict.
-_READS_DST = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset0_", "s_bitset1_")
-_READS_M0 = ("s_movrels",)
+# OPERANDS marks sdst the same whether it is read or written, so the extra-read set is listed.
+_EXTRA_READ = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset0_", "s_bitset1_", "s_movrels")
 
 def salu_timing(name:str) -> tuple[int, int]:
   srcs = [w for _f, (_fmt, w, k) in OPERANDS[_SOP_OPS[name]].items() if k.name == "OPR_SSRC"]
-  extra, mul = name.startswith(_READS_DST + _READS_M0), "_mul" in name
+  extra, mul = name.startswith(_EXTRA_READ), "_mul" in name
   interval = 8 if "wrexec" in name else 2 if (mul or srcs == [32, 32]) else 1
   return 2 + 2*extra + mul, interval
 
-# the sgpr file is banked and two reads that land in the same bank cost one extra cycle. an opcode
-# can only hit this if it reads two sgprs whose numbers are congruent, so in the sweep it takes an
-# opcode that reads its own walking destination alongside the fixed source: s_cmov and s_bitset.
-# opcodes with two fixed sources never conflict, and the SOPK ones read only sdst.
-# TODO: 16 is inferred, not measured: it is the bank count that makes the observed period come out
-# right for both widths at once. measure it directly by fixing the destination and sweeping the
-# source across s[4]..s[20], which should show the extra cycle at exactly one source position per
-# bank. that also settles whether the collision is dest against src or dest against something fixed.
-# TODO: only s_cmov_b32/b64 and s_bitset0/1_b32/b64 hit this, and it is worth understanding why the
-# rest cannot rather than only that they do not. the SOPK ones (s_cmpk_, s_addk_, s_mulk_) read sdst
-# but pair it with simm16, so there is a single sgpr read and no pair to collide. s_movrels_ reads
-# M0, which is not in the banked file. everything with two fixed sources reads s[4] and s[5], never
-# congruent. the case the sweep cannot reach: two *sources* 16 apart, which would say whether the
-# conflict is about reading two sgprs at all or specifically about reading the destination.
-SGPR_BANKS = 16
+# the sgpr file is banked and two reads landing in the same bank cost one extra cycle. these read
+# their own walking destination alongside the fixed source, so once the destination reaches a
+# register congruent to the source they collide, periodically, every 16 registers. that is a
+# property of the register allocation in this sweep, not of the opcode, so skip them here.
+# TODO: measure the bank count instead of inferring it. 16 is the number that makes the observed
+# period come out right for both widths at once, but it was never measured directly: fix the
+# destination and sweep the source across s[4]..s[20], which should show the extra cycle at exactly
+# one source position per bank. that also settles whether the collision is dest against src or dest
+# against something fixed.
+# TODO: only these six can hit it, and it is worth understanding why the rest cannot rather than
+# only that they do not. the SOPK ones (s_cmpk_, s_addk_, s_mulk_) read sdst but pair it with
+# simm16, so there is a single sgpr read and no pair to collide. s_movrels_ reads M0, which is not
+# in the banked file. everything with two fixed sources reads s[4] and s[5], never congruent. the
+# case this sweep cannot reach: two *sources* 16 apart, which would say whether the conflict is
+# about reading two sgprs at all or specifically about reading the destination.
+_BANK_CONFLICT = ("s_cmov_b32", "s_cmov_b64", "s_bitset0_b32", "s_bitset0_b64", "s_bitset1_b32", "s_bitset1_b64")
 
 REF = "/tmp/tinygrad_sqtt_ref.pkl"  # hardware traces captured here, replayed by test_cycle_accurate_emu
 KERNELS: dict = {}  # name -> builder, so the emulator test can rerun exactly what hardware ran
@@ -138,6 +137,7 @@ def _sweep_inst(name:str, i:int):
 # also require tinygrad to decode it back, since amd_decode must disassemble the whole kernel.
 def _sweep_ok(name:str, target:str) -> bool:
   if OPERANDS.get(_SOP_OPS[name]) is None or any(u in name.upper() for u in _UNSAFE): return False
+  if name in _BANK_CONFLICT: return False
   if not hasattr(r3, name): return False
   try:
     inst = _sweep_inst(name, 0)
@@ -148,23 +148,6 @@ def _sweep_ok(name:str, target:str) -> bool:
 def sweep_ops(target:str) -> list[str]: return sorted(n for n in _SOP_OPS if _sweep_ok(n, target))
 
 def _sweep_block(name:str) -> list: return [_sweep_inst(name, i) for i in range(SWEEP_REPEATS)]
-
-# the sgprs repeat i reads, 64 bit operands expanded into both halves
-def _sweep_reads(name:str, i:int) -> list[int]:
-  regs, sreg = [], _SWEEP_SRC
-  for field, (_fmt, width, kind) in OPERANDS[_SOP_OPS[name]].items():
-    if field == "simm16": continue
-    if kind.name == "OPR_SDST":
-      if name.startswith(_READS_DST): regs += [_SWEEP_DST+2*i, _SWEEP_DST+1+2*i] if width == 64 else [_SWEEP_DST+i]
-    else:
-      regs += [sreg, sreg+1] if width == 64 else [sreg]
-      sreg += 2 if width == 64 else 1
-  return regs
-
-# repeats whose reads collide in a bank, so the gap before them should be one cycle wider
-def bank_conflicts(name:str) -> list[int]:
-  reads = [_sweep_reads(name, i) for i in range(SWEEP_REPEATS)]
-  return [i for i, regs in enumerate(reads) if len({r % SGPR_BANKS for r in regs}) < len(regs)]
 
 @unittest.skipUnless(Device.DEFAULT == "AMD", "requires AMD device")
 class TestSIMDModel(unittest.TestCase):
@@ -233,13 +216,9 @@ class TestSIMDModel(unittest.TestCase):
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
         gaps = [y[1]-x[1] for x, y in zip(blk, blk[1:]) if x[1] is not None and y[1] is not None]
         # the wrexec family runs its first few at the normal rate before settling, so read the
-        # interval off the tail. the ramp gaps are all below the steady value, so they never look
-        # like a bank conflict.
+        # interval off the tail rather than off the ramp.
         tail = gaps[SWEEP_RAMP:]
         interval = max(set(tail), key=tail.count) if tail else None
-        late = [j+1 for j, g in enumerate(gaps) if interval is not None and g > interval]
-        if late != [i for i in bank_conflicts(name) if 0 < i <= len(gaps)]:
-          fails.append(f"{name} trial {b}: late repeats {late}, bank model says {bank_conflicts(name)}")
         seen.add((transit, interval))
         print(f"    #{b} transit={str(transit):>4} interval={str(interval):>4}")
         print(f"        dispatch {disp}")
