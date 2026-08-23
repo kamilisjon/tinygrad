@@ -49,9 +49,9 @@ assert TARGET_TO_ARCH[Device["AMD"].arch] == "rdna3", "only rdna3"
 # OPERANDS marks sdst the same whether it is read or written, so the extra-read set is listed.
 _EXTRA_READ = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset0_", "s_bitset1_", "s_movrels")
 
-def salu_timing(name:str) -> tuple[int, int]:
-  srcs = [w for _f, (_fmt, w, k) in OPERANDS[_SOP_OPS[name]].items() if k.name == "OPR_SSRC"]
-  extra, mul = name.startswith(_EXTRA_READ), "_mul" in name
+def salu_timing(op) -> tuple[int, int]:
+  srcs = [w for _f, (_fmt, w, k) in OPERANDS[op].items() if k.name == "OPR_SSRC"]
+  extra, mul = (n:=op.name.lower()).startswith(_EXTRA_READ), "_mul" in n
   interval = 2 if (mul or (len(srcs) == 2 and max(srcs) <= 32)) else 1
   return 2 + 2*extra + mul, interval
 
@@ -87,36 +87,34 @@ assert _SWEEP_DST + 2*SWEEP_REPEATS <= 104, f"SWEEP_REPEATS={SWEEP_REPEATS} need
 _UNSAFE = ("PC", "SAVEEXEC", "SETREG", "GETREG", "BRANCH", "CALL", "RFE", "ENDPGM", "TRAP",
            "SENDMSG", "SLEEP", "BARRIER", "WAITCNT", "NOP", "HALT", "PRIO", "ICACHE", "TTRACE",
            "WAKEUP", "PERFLEVEL", "VERSION", "CLAUSE", "DELAY", "WAIT", "MSG")
-_SOP_OPS = {m.name.lower(): m for en in (e3.SOP1Op, e3.SOP2Op, e3.SOPCOp, e3.SOPKOp) for m in en}
-
 # destinations walk upward from _SWEEP_DST so the repeats do not depend on each other
-def _sweep_inst(name:str, i:int):
+def _sweep_inst(op, i:int):
   kwargs, sreg = {}, _SWEEP_SRC
-  for field, (_fmt, width, kind) in OPERANDS[_SOP_OPS[name]].items():
+  for field, (_fmt, width, kind) in OPERANDS[op].items():
     if field == "simm16": kwargs[field] = 1
     elif kind.name == "OPR_SDST":
       kwargs[field] = s[_SWEEP_DST+2*i:_SWEEP_DST+1+2*i] if width == 64 else s[_SWEEP_DST+i]
     else:
       kwargs[field] = s[sreg:sreg+1] if width == 64 else s[sreg]
       sreg += 2 if width == 64 else 1
-  return getattr(r3, name)(**kwargs)
+  return getattr(r3, op.name.lower())(**kwargs)
 
 # keep an opcode only if this device really implements it. tinygrad's rdna3 enum is a union over
 # gfx11.0 and gfx11.5, so it contains scalar float ops (s_add_f32, s_cvt_*, ...) that gfx1102 has no
 # unit for: executing one raises sq_intr ILLEGAL_INST and hangs the queue. LLVM knows per target.
 # also require tinygrad to decode it back, since amd_decode must disassemble the whole kernel.
-def _sweep_ok(name:str, target:str) -> bool:
-  if OPERANDS.get(_SOP_OPS[name]) is None or any(u in name.upper() for u in _UNSAFE): return False
-  if not hasattr(r3, name): return False
+def _sweep_ok(op, target:str) -> bool:
+  if OPERANDS.get(op) is None or any(u in op.name for u in _UNSAFE): return False
+  if not hasattr(r3, name:=op.name.lower()): return False
   try:
-    inst = _sweep_inst(name, 0)
+    inst = _sweep_inst(op, 0)
     if repr(decode_inst(inst.to_bytes(), "rdna3")) != repr(inst): return False
     return llvm_disasm(inst.to_bytes(), target, get_mattr("rdna3"))[0].split()[0] == name
   except (TypeError, ValueError, KeyError, IndexError): return False  # opcode we cannot build or decode
 
-def sweep_ops(target:str, en) -> list[str]: return sorted(n for n in (m.name.lower() for m in en) if _sweep_ok(n, target))
+def sweep_ops(target:str, en) -> list: return sorted((m for m in en if _sweep_ok(m, target)), key=lambda m: m.name)
 
-def _sweep_block(name:str) -> list: return [_sweep_inst(name, i) for i in range(SWEEP_REPEATS)]
+def _sweep_block(op) -> list: return [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)]
 
 # one row of the emulator's trace against hardware's, green where they agree
 def _diff_row(vals:list, ref:list) -> str:
@@ -128,7 +126,8 @@ class TestSIMDModel(unittest.TestCase):
   # refuted by: an opcode whose dispatch_to_exec or interval is not what salu_timing() says
   def _sweep(self, en):
     fails = []
-    for name in sweep_ops(Device["AMD"].arch, en):
+    for op in sweep_ops(Device["AMD"].arch, en):
+      name = op.name.lower()
       # one kernel holding one block, dispatched SWEEP_BLOCKS times, so every trial runs the same
       # code at the same offset. the block is short enough that the prefetcher never runs dry.
       # every trial is kept. a handful of opcodes read dispatch_to_exec 4 on trial 0 and 2 on the rest, and
@@ -138,7 +137,7 @@ class TestSIMDModel(unittest.TestCase):
       # TODO: explain it. a cold first dispatch would slow every opcode, not five of them, so the
       # cause is something that varies per run. compare the full packet stream of trial 0 against
       # trial 1 for one affected opcode.
-      kname, block = f"custom_salu_{name}", _sweep_block(name) + [s_endpgm()]
+      kname, block = f"custom_salu_{name}", _sweep_block(op) + [s_endpgm()]
       projs, raw, lib, arch, simd = capture_runs(_kernel(kname, block), kname, SWEEP_BLOCKS)
       n_exec = sum(isinstance(p, ALUEXEC) for p, _ in map_insts(raw[0][0], lib, arch, simd))
       print(f"\n  **** {name}" + (f"   <- {n_exec} ALUEXEC for {SWEEP_REPEATS} instructions, pairing unreliable"
@@ -150,7 +149,7 @@ class TestSIMDModel(unittest.TestCase):
       except Exception as e:  # no pcode for this opcode, or it faulted
         emu, err = None, repr(e)
         print("    " + colored(f"emu  no trace: {err}", "red"))
-      seen, want, ref_rows = set(), salu_timing(name), {}
+      seen, want, ref_rows = set(), salu_timing(op), {}
       for b, proj in enumerate(projs + ([emu] if emu else [])):
         label = "emu" if b == len(projs) else f"#{b}"
         blk = [(t, e) for t, e, _, _op in proj]
