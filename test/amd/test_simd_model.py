@@ -114,8 +114,6 @@ def _sweep_ok(op, target:str) -> bool:
 
 def sweep_ops(target:str, en) -> list: return sorted((m for m in en if _sweep_ok(m, target)), key=lambda m: m.name)
 
-def _sweep_block(op) -> list: return [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)]
-
 # one row of the emulator's trace against hardware's, green where they agree
 def _diff_row(vals:list, ref:list) -> str:
   return "[" + ", ".join(colored(str(v), "green" if i < len(ref) and ref[i] == v else "red") for i, v in enumerate(vals)) + "]"
@@ -137,7 +135,8 @@ class TestSIMDModel(unittest.TestCase):
       # TODO: explain it. a cold first dispatch would slow every opcode, not five of them, so the
       # cause is something that varies per run. compare the full packet stream of trial 0 against
       # trial 1 for one affected opcode.
-      kname, block = f"custom_salu_{name}", _sweep_block(op) + [s_endpgm()]
+      kname = f"custom_salu_{name}"
+      block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
       projs, raw, lib, arch, simd = capture_runs(_kernel(kname, block), kname, SWEEP_BLOCKS)
       n_exec = sum(isinstance(p, ALUEXEC) for p, _ in map_insts(raw[0][0], lib, arch, simd))
       print(f"\n  **** {name}" + (f"   <- {n_exec} ALUEXEC for {SWEEP_REPEATS} instructions, pairing unreliable"
