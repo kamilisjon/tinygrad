@@ -55,36 +55,6 @@ def salu_timing(name:str) -> tuple[int, int]:
   interval = 2 if (mul or (len(srcs) == 2 and max(srcs) <= 32)) else 1
   return 2 + 2*extra + mul, interval
 
-# the sgpr file is banked and two reads landing in the same bank cost one extra cycle. these read
-# their own walking destination alongside the fixed source, so once the destination reaches a
-# register congruent to the source they collide, periodically, every 16 registers. that is a
-# property of the register allocation in this sweep, not of the opcode, so skip them here.
-# TODO: measure the bank count instead of inferring it. 16 is the number that makes the observed
-# period come out right for both widths at once, but it was never measured directly: fix the
-# destination and sweep the source across s[4]..s[20], which should show the extra cycle at exactly
-# one source position per bank. that also settles whether the collision is dest against src or dest
-# against something fixed.
-# TODO: only these six can hit it, and it is worth understanding why the rest cannot rather than
-# only that they do not. the SOPK ones (s_cmpk_, s_addk_, s_mulk_) read sdst but pair it with
-# simm16, so there is a single sgpr read and no pair to collide. s_movrels_ reads M0, which is not
-# in the banked file. everything with two fixed sources reads s[4] and s[5], never congruent. the
-# case this sweep cannot reach: two *sources* 16 apart, which would say whether the conflict is
-# about reading two sgprs at all or specifically about reading the destination.
-_BANK_CONFLICT = ("s_cmov_b32", "s_cmov_b64", "s_bitset0_b32", "s_bitset0_b64", "s_bitset1_b32", "s_bitset1_b64")
-
-# these read EXEC and write it back (EXEC, D = ~S0 & EXEC), so consecutive ones are a serial
-# dependency chain no matter which registers we hand them: EXEC is an implicit operand on both
-# sides. what they measure is therefore a dependent latency, 8 cycles, not an initiation interval
-# like every other entry in salu_timing, so they do not belong in the same sweep.
-# TODO: measure the 8 properly, with a kernel built for a chain rather than for independent repeats.
-# s_mov_b32 exec_lo, s[4+i] writes EXEC without reading it, so it separates the cost of writing EXEC
-# from the cost of chaining on it. filling the chain with independent work (wrexec then 7 s_mov)
-# says whether the 8 is a latency the SALU can hide or a stall that blocks the pipe, which are
-# different emulator models with identical evidence so far.
-# TODO: explain the ramp. the first ~9 run at 2 before it settles to 8, which a pure serial
-# dependency does not predict. seeding s[4] with 0 keeps EXEC constant and tells whether the ramp is
-# structural or a value-dependent EXECZ effect.
-_EXEC_CHAIN = ("s_and_not0_wrexec_b32", "s_and_not0_wrexec_b64", "s_and_not1_wrexec_b32", "s_and_not1_wrexec_b64")
 
 def _kernel(name:str, insts:list):
   def fxn(A:UOp) -> UOp:
@@ -137,7 +107,6 @@ def _sweep_inst(name:str, i:int):
 # also require tinygrad to decode it back, since amd_decode must disassemble the whole kernel.
 def _sweep_ok(name:str, target:str) -> bool:
   if OPERANDS.get(_SOP_OPS[name]) is None or any(u in name.upper() for u in _UNSAFE): return False
-  if name in _BANK_CONFLICT or name in _EXEC_CHAIN: return False
   if not hasattr(r3, name): return False
   try:
     inst = _sweep_inst(name, 0)
@@ -190,8 +159,8 @@ class TestSIMDModel(unittest.TestCase):
         dispatch_to_exec = None if blk[0][1] is None else blk[0][1] - blk[0][0]
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
         gaps = [y[1]-x[1] for x, y in zip(blk, blk[1:]) if x[1] is not None and y[1] is not None]
-        # the wrexec family runs its first few at the normal rate before settling, so read the
-        # interval off the tail rather than off the ramp.
+        # some opcodes run their first few at the normal rate before settling, so read the interval
+        # off the tail rather than off the ramp.
         tail = gaps[SWEEP_RAMP:]
         interval = max(set(tail), key=tail.count) if tail else None
         if label != "emu": seen.add((dispatch_to_exec, interval))
