@@ -137,13 +137,6 @@ def llvm_filter_valid_asm(tests:list[tuple[str, bytes]], mcpu:str, mattr:str) ->
   # Invalid instructions produce 0 bytes; also filter where LLVM roundtrip doesn't match original
   return [(asm, data) for (asm, data), chunk in zip(tests, results) if len(chunk) > 0 and chunk == data]
 
-def pkt_hist(blobs:list[bytes]) -> dict[str, int]:
-  from tinygrad.renderer.amd.sqtt import decode
-  import collections
-  c: collections.Counter = collections.Counter()
-  for b in blobs: c.update(type(x).__name__ for x in decode(b))
-  return dict(c)
-
 def capture(fxn:Callable, n_runs:int=1, simd_sel:int=0) -> tuple[list[list[bytes]], bytes, str]:
   a = Tensor.empty(32, dtype=dtypes.float32).contiguous().realize()
   runs, kern = [], 0
@@ -161,7 +154,7 @@ def capture(fxn:Callable, n_runs:int=1, simd_sel:int=0) -> tuple[list[list[bytes
   return runs, prg.lib, Device["AMD"].arch
 
 def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
-  sel, projs, lib, arch, seen = None, [], None, None, {}
+  sel, projs, lib, arch = None, [], None, None
   for _ in range(max_dispatch):
     if len(projs) == n_runs: break
     for simd_sel in (range(4) if sel is None else [sel]):
@@ -170,9 +163,7 @@ def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
         sel = simd_sel
         projs.append(pr)
         break
-      seen[simd_sel] = pkt_hist(blobs[0])
-  assert len(projs) == n_runs, \
-    f"only {len(projs)}/{n_runs} dispatches landed on a traced simd in {max_dispatch} tries; last packets seen: {seen}"
+  assert len(projs) == n_runs, f"only {len(projs)}/{n_runs} dispatches landed on a traced simd in {max_dispatch} tries"
   return projs, lib, arch
 
 def sram_scope(blob:bytes, lib:bytes, arch:str) -> list[tuple[int, int|None, int, str]]:
