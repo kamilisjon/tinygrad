@@ -25,11 +25,45 @@ from test.amd.helpers import TARGET_TO_ARCH, llvm_disasm, get_mattr, capture_run
 # dispatch->exec with an empty queue and an idle worker is not one number: the first instruction of
 # a wave costs more than a later one. measured on gfx1102 with s_add_i32.
 FIRST_INST_CYCLES = 4  # first instruction of the wave
-# (transit, initiation interval) per opcode, None is the default. multiply is its own class.
-SALU_TIMING: dict = {None: (2, 1), "s_mul_i32": (3, 2), "s_mul_hi_u32": (3, 2)}
-QUEUE_CYCLES = 2       # any later instruction
-# open: an 8 instruction chain starting with s_mov_b32 showed 2, not 4, for its first instruction, so
-# the extra cost is not paid by every opcode. unexplained.
+# transit and initiation interval are composed from properties of the opcode, not tabulated per
+# opcode. measured on gfx1102 over every SALU opcode the device implements:
+#   transit  = 2, +2 if the instruction needs a register read that is not a plain operand (its own
+#              destination, or an M0 indexed source), +1 if it multiplies
+#   interval = 2 if it multiplies, or if it reads exactly two 32 bit sgpr sources; 8 for the wrexec
+#              family; otherwise 1
+# the 64 bit siblings are the surprise: s_and_b64 sustains 1/cycle where s_and_b32 sustains 1 per 2,
+# and the same holds for or/xor/nand/nor/xnor/lshl/lshr/ashr/bfe/cmp/cselect. s_bfm_b64 identifies
+# the mechanism: 64 bit destination but 32 bit sources, and it reads 2 like the 32 bit ops. so the
+# cost is in the source reads, not the width of the result.
+# s_movk_i32 is the control for the +2 transit term: it writes sdst without reading it, and is the
+# only SOPK opcode at transit 2.
+# OPERANDS marks sdst the same whether it is read or written, so the extra-read set is listed. it is
+# split by where the extra read goes: the sgpr file, or M0. only the first kind can bank conflict.
+_READS_DST = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset0_", "s_bitset1_")
+_READS_M0 = ("s_movrels",)
+
+def salu_timing(name:str) -> tuple[int, int]:
+  srcs = [w for _f, (_fmt, w, k) in OPERANDS[_SOP_OPS[name]].items() if k.name == "OPR_SSRC"]
+  extra, mul = name.startswith(_READS_DST + _READS_M0), "_mul" in name
+  interval = 8 if "wrexec" in name else 2 if (mul or srcs == [32, 32]) else 1
+  return 2 + 2*extra + mul, interval
+
+# the sgpr file is banked and two reads that land in the same bank cost one extra cycle. an opcode
+# can only hit this if it reads two sgprs whose numbers are congruent, so in the sweep it takes an
+# opcode that reads its own walking destination alongside the fixed source: s_cmov and s_bitset.
+# opcodes with two fixed sources never conflict, and the SOPK ones read only sdst.
+# TODO: 16 is inferred, not measured: it is the bank count that makes the observed period come out
+# right for both widths at once. measure it directly by fixing the destination and sweeping the
+# source across s[4]..s[20], which should show the extra cycle at exactly one source position per
+# bank. that also settles whether the collision is dest against src or dest against something fixed.
+# TODO: only s_cmov_b32/b64 and s_bitset0/1_b32/b64 hit this, and it is worth understanding why the
+# rest cannot rather than only that they do not. the SOPK ones (s_cmpk_, s_addk_, s_mulk_) read sdst
+# but pair it with simm16, so there is a single sgpr read and no pair to collide. s_movrels_ reads
+# M0, which is not in the banked file. everything with two fixed sources reads s[4] and s[5], never
+# congruent. the case the sweep cannot reach: two *sources* 16 apart, which would say whether the
+# conflict is about reading two sgprs at all or specifically about reading the destination.
+SGPR_BANKS = 16
+
 REF = "/tmp/tinygrad_sqtt_ref.pkl"  # hardware traces captured here, replayed by test_cycle_accurate_emu
 KERNELS: dict = {}  # name -> builder, so the emulator test can rerun exactly what hardware ran
 
@@ -61,13 +95,23 @@ custom_salu_after_idle = _kernel("custom_salu_after_idle", [
 ])
 
 # ── SALU sweep ───────────────────────────────────────────────────────────────────────────────────
-# One block per instruction: drain the queue with nops, then dispatch the instruction 5 times to
-# different destinations so the repeats are independent. The first of the 5 lands on an idle queue
-# and measures transit; the spacing between their execs measures how fast the worker takes new work.
-SWEEP_REPEATS, SWEEP_DRAIN, SWEEP_BLOCKS = 50, 20, 3
-# 64 bit destinations take two sgprs each, so sources have to start above all of them or the later
-# repeats overwrite their own inputs and become a dependent chain
-_SWEEP_SRC = 10 + 2*SWEEP_REPEATS
+# One kernel per instruction, holding nothing but that instruction SWEEP_REPEATS times, each writing
+# a different destination so the repeats are independent. The wave starts with an empty queue, so the
+# first one measures transit; the spacing between their execs measures how fast the worker takes new
+# work. No drain is needed: the kernel is the block.
+# a wave prefetches at most 3 instruction cache lines (3*64 bytes) ahead of the pc plus the line it
+# is on, so 256 bytes = 64 instructions of straight line code run before it catches the prefetcher
+# and stalls ~235 cycles for a real fetch. keep the whole kernel under that and the stall never
+# happens, instead of landing mid block and corrupting whichever repeat it hits.
+SWEEP_REPEATS, SWEEP_BLOCKS, SWEEP_RAMP = 48, 3, 10
+assert SWEEP_REPEATS + 1 <= 64, "kernel would outrun the prefetcher"
+# sources sit below the destinations and are shared by every repeat. putting them above instead
+# makes the base scale with SWEEP_REPEATS and silently run off the end of the sgpr file. an opcode
+# reads at most two 64 bit sources, so four registers cover every one of them, and they start above
+# s[0:1] to leave the kernarg pointer alone. 64 bit destinations take two registers each, and
+# s[0]..s[105] is the whole file, of which the top pair is left free for vcc.
+_SWEEP_SRC, _SWEEP_DST = 4, 8
+assert _SWEEP_DST + 2*SWEEP_REPEATS <= 104, f"SWEEP_REPEATS={SWEEP_REPEATS} needs more sgprs than exist" 
 
 # every scalar ALU opcode except the ones that would not come back: anything touching the PC, EXEC,
 # hardware registers, or wave state. SOPP is control flow only and emits no exec packet.
@@ -76,12 +120,13 @@ _UNSAFE = ("PC", "SAVEEXEC", "SETREG", "GETREG", "BRANCH", "CALL", "RFE", "ENDPG
            "WAKEUP", "PERFLEVEL", "VERSION", "CLAUSE", "DELAY", "WAIT", "MSG")
 _SOP_OPS = {m.name.lower(): m for en in (e3.SOP1Op, e3.SOP2Op, e3.SOPCOp, e3.SOPKOp) for m in en}
 
-# destinations walk upward from s[10] so the repeats do not depend on each other
+# destinations walk upward from _SWEEP_DST so the repeats do not depend on each other
 def _sweep_inst(name:str, i:int):
   kwargs, sreg = {}, _SWEEP_SRC
   for field, (_fmt, width, kind) in OPERANDS[_SOP_OPS[name]].items():
     if field == "simm16": kwargs[field] = 1
-    elif kind.name == "OPR_SDST": kwargs[field] = s[10+2*i:11+2*i] if width == 64 else s[10+i]
+    elif kind.name == "OPR_SDST":
+      kwargs[field] = s[_SWEEP_DST+2*i:_SWEEP_DST+1+2*i] if width == 64 else s[_SWEEP_DST+i]
     else:
       kwargs[field] = s[sreg:sreg+1] if width == 64 else s[sreg]
       sreg += 2 if width == 64 else 1
@@ -98,12 +143,28 @@ def _sweep_ok(name:str, target:str) -> bool:
     inst = _sweep_inst(name, 0)
     if repr(decode_inst(inst.to_bytes(), "rdna3")) != repr(inst): return False
     return llvm_disasm(inst.to_bytes(), target, get_mattr("rdna3"))[0].split()[0] == name
-  except Exception: return False
+  except (TypeError, ValueError, KeyError, IndexError): return False  # opcode we cannot build or decode
 
 def sweep_ops(target:str) -> list[str]: return sorted(n for n in _SOP_OPS if _sweep_ok(n, target))
 
-def _sweep_block(name:str) -> list:
-  return [s_nop(0) for _ in range(SWEEP_DRAIN)] + [_sweep_inst(name, i) for i in range(SWEEP_REPEATS)]
+def _sweep_block(name:str) -> list: return [_sweep_inst(name, i) for i in range(SWEEP_REPEATS)]
+
+# the sgprs repeat i reads, 64 bit operands expanded into both halves
+def _sweep_reads(name:str, i:int) -> list[int]:
+  regs, sreg = [], _SWEEP_SRC
+  for field, (_fmt, width, kind) in OPERANDS[_SOP_OPS[name]].items():
+    if field == "simm16": continue
+    if kind.name == "OPR_SDST":
+      if name.startswith(_READS_DST): regs += [_SWEEP_DST+2*i, _SWEEP_DST+1+2*i] if width == 64 else [_SWEEP_DST+i]
+    else:
+      regs += [sreg, sreg+1] if width == 64 else [sreg]
+      sreg += 2 if width == 64 else 1
+  return regs
+
+# repeats whose reads collide in a bank, so the gap before them should be one cycle wider
+def bank_conflicts(name:str) -> list[int]:
+  reads = [_sweep_reads(name, i) for i in range(SWEEP_REPEATS)]
+  return [i for i, regs in enumerate(reads) if len({r % SGPR_BANKS for r in regs}) < len(regs)]
 
 @unittest.skipUnless(Device.DEFAULT == "AMD", "requires AMD device")
 class TestSIMDModel(unittest.TestCase):
@@ -154,41 +215,39 @@ class TestSIMDModel(unittest.TestCase):
   # interval back to back. exceptions are listed, and anything new is a discovery.
   # refuted by: an opcode whose transit or interval is not what SALU_TIMING says
   def test_salu_sweep(self):
-    ops_names = sweep_ops(Device["AMD"].arch)
-    insts = [x for n in ops_names for _ in range(SWEEP_BLOCKS) for x in _sweep_block(n)]
-    kernel = _kernel("custom_salu_sweep", insts + [s_endpgm()], register=False)
-    proj = self._capture(kernel, "custom_salu_sweep")
-    ops = [(t, e) for t, e, _, op in proj if op != "S_NOP"]
-    self.assertEqual(len(ops), len(ops_names)*SWEEP_REPEATS*SWEEP_BLOCKS, "unexpected instruction count")
-    # sram_scope pairs one ALUEXEC per dispatch. if the hardware emits more than one per instruction
-    # (a 64 bit op retiring in two halves would) that pairing silently shifts and every transit and
-    # interval below is wrong, so count the packets before trusting any of it.
-    n_exec = sum(isinstance(p, ALUEXEC) for p, _ in map_insts(*self.raw))
-    print(f"\n  {n_exec} ALUEXEC packets for {len(ops)} SALU instructions"
-          f"{'  <- pairing is unreliable' if n_exec != len(ops) else ''}")
     fails = []
-    for i, name in enumerate(ops_names):
-      print(f"\n  **** {name}")
+    for name in sweep_ops(Device["AMD"].arch):
+      # one kernel holding one block, dispatched SWEEP_BLOCKS times, so every trial runs the same
+      # code at the same offset. the block is short enough that the prefetcher never runs dry.
+      kname = f"custom_salu_{name}"
+      kernel = _kernel(kname, _sweep_block(name) + [s_endpgm()], register=False)
+      projs, raw, lib, arch, simd = capture_runs(kernel, kname, SWEEP_BLOCKS)
+      n_exec = sum(isinstance(p, ALUEXEC) for p, _ in map_insts(raw[0][0], lib, arch, simd))
+      print(f"\n  **** {name}" + (f"   <- {n_exec} ALUEXEC for {SWEEP_REPEATS} instructions, pairing unreliable"
+                                   if n_exec != SWEEP_REPEATS else ""))
       seen = set()
-      for b in range(SWEEP_BLOCKS):
-        blk = ops[(i*SWEEP_BLOCKS + b)*SWEEP_REPEATS:][:SWEEP_REPEATS]
+      for b, proj in enumerate(projs):
+        blk = [(t, e) for t, e, _, _op in proj]
+        self.assertEqual(len(blk), SWEEP_REPEATS, f"{name} trial {b}: unexpected instruction count")
         transit = None if blk[0][1] is None else blk[0][1] - blk[0][0]
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
         gaps = [y[1]-x[1] for x, y in zip(blk, blk[1:]) if x[1] is not None and y[1] is not None]
-        # the interval is the mode: a kernel this long takes icache misses that stall the whole wave
-        # for ~250 cycles, and those show up as one huge gap among otherwise equal ones
-        interval = max(set(gaps), key=gaps.count) if gaps else None
+        # the wrexec family runs its first few at the normal rate before settling, so read the
+        # interval off the tail. the ramp gaps are all below the steady value, so they never look
+        # like a bank conflict.
+        tail = gaps[SWEEP_RAMP:]
+        interval = max(set(tail), key=tail.count) if tail else None
+        late = [j+1 for j, g in enumerate(gaps) if interval is not None and g > interval]
+        if late != [i for i in bank_conflicts(name) if 0 < i <= len(gaps)]:
+          fails.append(f"{name} trial {b}: late repeats {late}, bank model says {bank_conflicts(name)}")
         seen.add((transit, interval))
-        # a 64 bit op may retire as two exec packets; sram_scope pairs them FIFO one per dispatch, so
-        # unpaired is nonzero when the pairing (and therefore transit and interval) is unreliable
-        paired = sum(1 for x in blk if x[1] is not None)
-        print(f"    #{b} transit={str(transit):>4} interval={str(interval):>4} paired={paired}/{len(blk)}")
+        print(f"    #{b} transit={str(transit):>4} interval={str(interval):>4}")
         print(f"        dispatch {disp}")
         print(f"        exec     {gaps}")
-      want = SALU_TIMING.get(name, SALU_TIMING[None])
-      if len(seen) > 1: fails.append(f"{name}: unstable across blocks, {sorted(seen)}")
+      want = salu_timing(name)
+      if len(seen) > 1: fails.append(f"{name}: unstable across trials, {sorted(seen)}")
       elif seen != {want}: fails.append(f"{name}: {seen.pop()}, expected {want}")
-    self.assertFalse(fails, f"{len(fails)} opcodes disagree with SALU_TIMING:\n" + "\n".join(fails))
+    self.assertFalse(fails, f"{len(fails)} opcodes disagree with salu_timing():\n" + "\n".join(fails))
 
 if __name__ == "__main__":
   unittest.main()
