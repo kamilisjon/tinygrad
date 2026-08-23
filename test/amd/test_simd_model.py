@@ -46,11 +46,8 @@ def _sweep_inst(op, i:int):
 
 def _sweep_ok(op) -> bool:
   if OPERANDS.get(op) is None or any(u in op.name for u in _UNSAFE): return False
-  if not hasattr(r3, op.name.lower()): return False
   inst = _sweep_inst(op, 0)
   return repr(decode_inst(inst.to_bytes(), "rdna3")) == repr(inst)
-
-def sweep_ops(en) -> list: return sorted((m for m in en if _sweep_ok(m)), key=lambda m: m.name)
 
 def _diff_row(vals:list, ref:list) -> str:
   return "[" + ", ".join(colored(str(v), "green" if i < len(ref) and ref[i] == v else "red") for i, v in enumerate(vals)) + "]"
@@ -58,7 +55,7 @@ def _diff_row(vals:list, ref:list) -> str:
 class TestSIMDModel(unittest.TestCase):
   def _sweep(self, en):
     fails = []
-    for op in sweep_ops(en):
+    for op in sorted((m for m in en if _sweep_ok(m)), key=lambda m: m.name):
       name = op.name.lower()
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
