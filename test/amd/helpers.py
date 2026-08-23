@@ -171,7 +171,7 @@ def project(blobs:list[bytes], lib:bytes, arch:str, simd:int):
   return None
 
 def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
-  sel, projs, raw, lib, arch, seen = None, [], [], None, None, {}
+  sel, projs, lib, arch, seen = None, [], None, None, {}
   for _ in range(max_dispatch):
     if len(projs) == n_runs: break
     for simd_sel in (range(4) if sel is None else [sel]):
@@ -179,12 +179,11 @@ def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
       if (pr:=project(blobs[0], lib, arch, simd_sel)) is not None:
         sel = simd_sel
         projs.append(pr)
-        raw.append(blobs[0])
         break
       seen[simd_sel] = pkt_hist(blobs[0])
   assert len(projs) == n_runs, \
     f"only {len(projs)}/{n_runs} dispatches landed on a traced simd in {max_dispatch} tries; last packets seen: {seen}"
-  return projs, raw, lib, arch, sel
+  return projs, lib, arch
 
 _DISPATCH_TO_EXEC = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
                      "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}

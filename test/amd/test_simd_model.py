@@ -3,7 +3,6 @@ from tinygrad import Device
 from tinygrad.helpers import colored, DEBUG
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.renderer.amd.dsl import s, OPERANDS
-from tinygrad.renderer.amd.sqtt import map_insts, ALUEXEC
 import tinygrad.runtime.autogen.amd.rdna3.ins as r3
 import tinygrad.runtime.autogen.amd.rdna3.enum as e3
 from tinygrad.renderer.amd import decode_inst
@@ -66,7 +65,7 @@ class TestSIMDModel(unittest.TestCase):
       name = op.name.lower()
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
-      projs, raw, lib, arch, simd = capture_runs(_kernel(kname, block), SWEEP_BLOCKS)
+      projs, lib, arch = capture_runs(_kernel(kname, block), SWEEP_BLOCKS)
       try: emu, err = sram_scope(capture_emu(block), lib, arch, 0), None
       except Exception as e: emu, err = None, repr(e)
       was = len(fails)
@@ -76,9 +75,7 @@ class TestSIMDModel(unittest.TestCase):
       elif (times_of(emu), execs_of(emu)) != (times_of(projs[0]), execs_of(projs[0])):
         fails.append(f"{name}: emulator timing differs from hardware")
       if (ok := len(fails) == was) and DEBUG < 1: continue
-      n_exec = sum(isinstance(p, ALUEXEC) for p, _ in map_insts(raw[0][0], lib, arch, simd))
-      print(f"\n  **** {name}" + (f"   <- {n_exec} ALUEXEC for {SWEEP_REPEATS} instructions, pairing unreliable"
-                                   if n_exec != SWEEP_REPEATS else ""))
+      print(f"\n  **** {name}")
       if emu is None: print("    " + colored(f"emu  no trace: {err}", "red"))
       ref_rows = {}
       for b, proj in enumerate(projs + ([emu] if emu else [])):
