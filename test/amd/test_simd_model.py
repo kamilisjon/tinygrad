@@ -66,7 +66,7 @@ class TestSIMDModel(unittest.TestCase):
       name = op.name.lower()
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
-      projs, raw, lib, arch, simd = capture_runs(_kernel(kname, block), kname, SWEEP_BLOCKS)
+      projs, raw, lib, arch, simd = capture_runs(_kernel(kname, block), SWEEP_BLOCKS)
       try: emu, err = sram_scope(capture_emu(block), lib, arch, 0), None
       except Exception as e: emu, err = None, repr(e)
       was = len(fails)

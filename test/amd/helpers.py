@@ -137,13 +137,10 @@ def llvm_filter_valid_asm(tests:list[tuple[str, bytes]], mcpu:str, mattr:str) ->
   # Invalid instructions produce 0 bytes; also filter where LLVM roundtrip doesn't match original
   return [(asm, data) for (asm, data), chunk in zip(tests, results) if len(chunk) > 0 and chunk == data]
 
-def _lib_for(kern:int|None, kname:str) -> bytes:
+def _lib_for(kern:int) -> bytes:
   prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
-  if kern is not None:
-    assert (e:=prgs.get(kern)) is not None and e.lib, f"no ProfileProgramEvent tagged {kern}"
-    return e.lib
-  assert (c:=[e for e in prgs.values() if e.name == kname and e.lib]), f"no ProfileProgramEvent for {kname}, is PROFILE=1 set?"
-  return c[-1].lib
+  assert (e:=prgs.get(kern)) is not None and e.lib, f"no ProfileProgramEvent tagged {kern}, is PROFILE=1 set?"
+  return e.lib
 
 def pkt_hist(blobs:list[bytes]) -> dict[str, int]:
   from tinygrad.renderer.amd.sqtt import decode
@@ -152,26 +149,19 @@ def pkt_hist(blobs:list[bytes]) -> dict[str, int]:
   for b in blobs: c.update(type(x).__name__ for x in decode(b))
   return dict(c)
 
-def capture(fxn:Callable, kname:str, n_runs:int=1, simd_sel:int=0) -> tuple[list[list[bytes]], bytes, str]:
-  import test.mockgpu.amd.emu as emu
-  on_hw = "MOCK" not in type(Device["AMD"].iface).__name__
+def capture(fxn:Callable, n_runs:int=1, simd_sel:int=0) -> tuple[list[list[bytes]], bytes, str]:
   a = Tensor.empty(32, dtype=dtypes.float32).contiguous().realize()
-  runs, kern = [], None
+  runs, kern = [], 0
   for _ in range(n_runs):
     start = len(Compiled.profile_events)
-    emu.sqtt_traces.clear()
     with Context(SQTT_LIMIT_SE=1, SQTT_ITRACE_SE_MASK=1, SQTT_SIMD_SEL=simd_sel):
       Tensor.custom_kernel(a, fxn=fxn)[0].realize()
     Device[Device.DEFAULT].synchronize()
-    if on_hw:
-      evs = [e for e in Compiled.profile_events[start:] if type(e).__name__ == "ProfileSQTTEvent" and e.itrace]
-      assert evs, "hardware produced no instruction-traced SQTT events, is SQTT=1 set?"
-      kern = evs[0].kern
-      runs.append([e.blob for e in evs])
-    else:
-      assert emu.sqtt_traces, "emulator produced no SQTT trace, is PROFILE=1 set?"
-      runs.append(list(emu.sqtt_traces))
-  return runs, _lib_for(kern, kname), Device["AMD"].arch
+    evs = [e for e in Compiled.profile_events[start:] if type(e).__name__ == "ProfileSQTTEvent" and e.itrace]
+    assert evs, "hardware produced no instruction-traced SQTT events, is SQTT=1 set?"
+    kern = evs[0].kern
+    runs.append([e.blob for e in evs])
+  return runs, _lib_for(kern), Device["AMD"].arch
 
 def project(blobs:list[bytes], lib:bytes, arch:str, simd:int):
   for b in blobs:
@@ -180,12 +170,12 @@ def project(blobs:list[bytes], lib:bytes, arch:str, simd:int):
     if p: return p
   return None
 
-def capture_runs(fxn:Callable, kname:str, n_runs:int=1, max_dispatch:int=40):
+def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
   sel, projs, raw, lib, arch, seen = None, [], [], None, None, {}
   for _ in range(max_dispatch):
     if len(projs) == n_runs: break
     for simd_sel in (range(4) if sel is None else [sel]):
-      blobs, lib, arch = capture(fxn, kname, 1, simd_sel)
+      blobs, lib, arch = capture(fxn, 1, simd_sel)
       if (pr:=project(blobs[0], lib, arch, simd_sel)) is not None:
         sel = simd_sel
         projs.append(pr)
