@@ -163,18 +163,13 @@ def capture(fxn:Callable, n_runs:int=1, simd_sel:int=0) -> tuple[list[list[bytes
     runs.append([e.blob for e in evs])
   return runs, _lib_for(kern), Device["AMD"].arch
 
-def project(blobs:list[bytes], lib:bytes, arch:str):
-  for b in blobs:
-    if p:=sram_scope(b, lib, arch): return p
-  return None
-
 def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
   sel, projs, lib, arch, seen = None, [], None, None, {}
   for _ in range(max_dispatch):
     if len(projs) == n_runs: break
     for simd_sel in (range(4) if sel is None else [sel]):
       blobs, lib, arch = capture(fxn, 1, simd_sel)
-      if (pr:=project(blobs[0], lib, arch)) is not None:
+      if pr:=next((p for b in blobs[0] if (p:=sram_scope(b, lib, arch))), None):
         sel = simd_sel
         projs.append(pr)
         break
