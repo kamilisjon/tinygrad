@@ -163,9 +163,9 @@ def capture(fxn:Callable, n_runs:int=1, simd_sel:int=0) -> tuple[list[list[bytes
     runs.append([e.blob for e in evs])
   return runs, _lib_for(kern), Device["AMD"].arch
 
-def project(blobs:list[bytes], lib:bytes, arch:str, simd:int):
+def project(blobs:list[bytes], lib:bytes, arch:str):
   for b in blobs:
-    if p:=sram_scope(b, lib, arch, simd): return p
+    if p:=sram_scope(b, lib, arch): return p
   return None
 
 def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
@@ -174,7 +174,7 @@ def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
     if len(projs) == n_runs: break
     for simd_sel in (range(4) if sel is None else [sel]):
       blobs, lib, arch = capture(fxn, 1, simd_sel)
-      if (pr:=project(blobs[0], lib, arch, simd_sel)) is not None:
+      if (pr:=project(blobs[0], lib, arch)) is not None:
         sel = simd_sel
         projs.append(pr)
         break
@@ -186,10 +186,10 @@ def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
 _DISPATCH_TO_EXEC = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
                      "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
 
-def sram_scope(blob:bytes, lib:bytes, arch:str, simd:int=0) -> list[tuple[int, int|None, int, str]]:
+def sram_scope(blob:bytes, lib:bytes, arch:str) -> list[tuple[int, int|None, int, str]]:
   out: list[list] = []
   pending: dict[str, list[int]] = {}
-  for p, info in map_insts(blob, lib, arch, simd):
+  for p, info in map_insts(blob, lib, arch):
     if isinstance(p, (ALUEXEC, VMEMEXEC)):
       for q in (["VALU", "SALU"] if (n:=p.src.name) == "VALU_SALU" else [n]):
         if pending.get(q): out[pending[q].pop(0)][1] = p._time

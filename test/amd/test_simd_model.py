@@ -64,7 +64,7 @@ class TestSIMDModel(unittest.TestCase):
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
       projs, lib, arch = capture_runs(_kernel(kname, block), SWEEP_BLOCKS)
-      emu = sram_scope(capture_emu(block), lib, arch, 0)
+      emu = sram_scope(capture_emu(block), lib, arch)
       was = len(fails)
       if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: hardware trials disagree with each other")
       if insts_of(emu) != insts_of(projs[0]): fails.append(f"{name}: emulator executed different instructions")
