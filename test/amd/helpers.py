@@ -137,33 +137,34 @@ def llvm_filter_valid_asm(tests:list[tuple[str, bytes]], mcpu:str, mattr:str) ->
   # Invalid instructions produce 0 bytes; also filter where LLVM roundtrip doesn't match original
   return [(asm, data) for (asm, data), chunk in zip(tests, results) if len(chunk) > 0 and chunk == data]
 
+_phase = 0  # waves alternate between simd 0 and simd 2 on every dispatch, so the traced simd does too
+
 def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
+  global _phase
   a = Tensor.empty(32, dtype=dtypes.float32).contiguous().realize()
-  arch, sel, projs, lib = Device["AMD"].arch, None, [], None
+  arch, projs, lib = Device["AMD"].arch, [], None
   for _ in range(max_dispatch):
     if len(projs) == n_runs: break
-    for simd_sel in (range(2) if sel is None else [sel]):
-      start = len(Compiled.profile_events)
-      with Context(SQTT_LIMIT_SE=1, SQTT_ITRACE_SE_MASK=1, SQTT_SIMD_SEL=simd_sel):
-        Tensor.custom_kernel(a, fxn=fxn)[0].realize()
-      Device[Device.DEFAULT].synchronize()
-      evs = [e for e in Compiled.profile_events[start:] if type(e).__name__ == "ProfileSQTTEvent" and e.itrace]
-      assert evs, "hardware produced no instruction-traced SQTT events, is SQTT=1 set?"
-      if lib is None:
-        prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
-        assert (prg:=prgs.get(evs[0].kern)) is not None and prg.lib, f"no ProfileProgramEvent tagged {evs[0].kern}, is PROFILE=1 set?"
-        lib = prg.lib
-      if pr:=next((p for e in evs if (p:=sram_scope(e.blob, lib, arch))), None):
-        sel = simd_sel
-        projs.append(pr)
-        break
+    simd, _phase = (0, 2)[_phase], 1 - _phase
+    st = len(Compiled.profile_events)
+    with Context(SQTT_LIMIT_SE=1, SQTT_ITRACE_SE_MASK=1, SQTT_SIMD_SEL=simd):
+      Tensor.custom_kernel(a, fxn=fxn)[0].realize()
+    Device[Device.DEFAULT].synchronize()
+    evs = [e for e in Compiled.profile_events[st:] if type(e).__name__ == "ProfileSQTTEvent" and e.itrace]
+    assert evs, "hardware produced no instruction-traced SQTT events, is SQTT=1 set?"
+    if lib is None:
+      prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
+      assert (prg:=prgs.get(evs[0].kern)) is not None and prg.lib, f"no ProfileProgramEvent tagged {evs[0].kern}, is PROFILE=1 set?"
+      lib = prg.lib
+    if pr:=next((p for e in evs if (p:=sram_scope(e.blob, lib, arch, simd))), None): projs.append(pr)
+    else: _phase = 1 - _phase  # out of phase, resync
   assert len(projs) == n_runs, f"only {len(projs)}/{n_runs} dispatches landed on a traced simd in {max_dispatch} tries"
   return projs, lib, arch
 
-def sram_scope(blob:bytes, lib:bytes, arch:str) -> list[tuple[int, int|None, int, str]]:
+def sram_scope(blob:bytes, lib:bytes, arch:str, simd:int=0) -> list[tuple[int, int|None, int, str]]:
   out: list[list] = []
   pending: dict[str, list[int]] = {}
-  for p, info in map_insts(blob, lib, arch):
+  for p, info in map_insts(blob, lib, arch, simd):
     if isinstance(p, (ALUEXEC, VMEMEXEC)):
       for q in (["VALU", "SALU"] if (n:=p.src.name) == "VALU_SALU" else [n]):
         if pending.get(q): out[pending[q].pop(0)][1] = p._time
