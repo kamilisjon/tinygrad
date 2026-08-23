@@ -232,27 +232,27 @@ class TestSIMDModel(unittest.TestCase):
       n_exec = sum(isinstance(p, ALUEXEC) for p, _ in map_insts(raw[0][0], lib, arch, simd))
       print(f"\n  **** {name}" + (f"   <- {n_exec} ALUEXEC for {SWEEP_REPEATS} instructions, pairing unreliable"
                                    if n_exec != SWEEP_REPEATS else ""))
-      seen = set()
+      seen, want = set(), salu_timing(name)
       for b, proj in enumerate(projs):
         blk = [(t, e) for t, e, _, _op in proj]
         self.assertEqual(len(blk), SWEEP_REPEATS, f"{name} trial {b}: unexpected instruction count")
-        d2e = None if blk[0][1] is None else blk[0][1] - blk[0][0]
+        dispatch_to_exec = None if blk[0][1] is None else blk[0][1] - blk[0][0]
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
         gaps = [y[1]-x[1] for x, y in zip(blk, blk[1:]) if x[1] is not None and y[1] is not None]
         # the wrexec family runs its first few at the normal rate before settling, so read the
         # interval off the tail rather than off the ramp.
         tail = gaps[SWEEP_RAMP:]
         interval = max(set(tail), key=tail.count) if tail else None
-        seen.add((d2e, interval))
+        seen.add((dispatch_to_exec, interval))
         # absolute cycles first, then the gaps between them. dispatch_to_exec is the vertical
         # distance between the two rows, so it is the first exec time once both are anchored on 0.
         t0 = blk[0][0]
-        print(f"    #{b} d2e={str(d2e):>4} interval={str(interval):>4}")
+        print(f"    #{b}")
         print(f"        dispatch {[t - t0 for t, _ in blk]}")
         print(f"        exec     {[None if e is None else e - t0 for _, e in blk]}")
+        print(f"        d to e   {[None if e is None else e - t for t, e in blk]}")
         print(f"        d gaps   {disp}")
         print(f"        e gaps   {gaps}")
-      want = salu_timing(name)
       if len(seen) > 1: fails.append(f"{name}: unstable across trials, {sorted(seen)}")
       elif seen != {want}: fails.append(f"{name}: {seen.pop()}, expected {want}")
     self.assertFalse(fails, f"{len(fails)} opcodes disagree with salu_timing():\n" + "\n".join(fails))
