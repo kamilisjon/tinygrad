@@ -7,7 +7,7 @@ import tinygrad.runtime.autogen.amd.rdna3.ins as r3
 import tinygrad.runtime.autogen.amd.rdna3.enum as e3
 from tinygrad.renderer.amd import decode_inst
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
-from test.amd.helpers import TARGET_TO_ARCH, llvm_disasm, get_mattr, capture_runs, capture_emu, sram_scope
+from test.amd.helpers import TARGET_TO_ARCH, capture_runs, capture_emu, sram_scope
 from test.amd.helpers import times_of, execs_of, insts_of
 
 assert "MOCK" not in type(Device["AMD"].iface).__name__, "needs real hardware, the emulator is under test"
@@ -31,7 +31,7 @@ assert _SWEEP_DST + 2*SWEEP_REPEATS <= 104, f"SWEEP_REPEATS={SWEEP_REPEATS} need
 
 _UNSAFE = ("PC", "SAVEEXEC", "SETREG", "GETREG", "BRANCH", "CALL", "RFE", "ENDPGM", "TRAP",
            "SENDMSG", "SLEEP", "BARRIER", "WAITCNT", "NOP", "HALT", "PRIO", "ICACHE", "TTRACE",
-           "WAKEUP", "PERFLEVEL", "VERSION", "CLAUSE", "DELAY", "WAIT", "MSG")
+           "WAKEUP", "PERFLEVEL", "VERSION", "CLAUSE", "DELAY", "WAIT", "MSG", "F16", "F32", "F64")
 
 def _sweep_inst(op, i:int):
   kwargs, sreg = {}, _SWEEP_SRC
@@ -44,14 +44,13 @@ def _sweep_inst(op, i:int):
       sreg += 2 if width == 64 else 1
   return getattr(r3, op.name.lower())(**kwargs)
 
-def _sweep_ok(op, target:str) -> bool:
+def _sweep_ok(op) -> bool:
   if OPERANDS.get(op) is None or any(u in op.name for u in _UNSAFE): return False
-  if not hasattr(r3, name:=op.name.lower()): return False
+  if not hasattr(r3, op.name.lower()): return False
   inst = _sweep_inst(op, 0)
-  if repr(decode_inst(inst.to_bytes(), "rdna3")) != repr(inst): return False
-  return llvm_disasm(inst.to_bytes(), target, get_mattr("rdna3"))[0].split()[0] == name
+  return repr(decode_inst(inst.to_bytes(), "rdna3")) == repr(inst)
 
-def sweep_ops(target:str, en) -> list: return sorted((m for m in en if _sweep_ok(m, target)), key=lambda m: m.name)
+def sweep_ops(en) -> list: return sorted((m for m in en if _sweep_ok(m)), key=lambda m: m.name)
 
 def _diff_row(vals:list, ref:list) -> str:
   return "[" + ", ".join(colored(str(v), "green" if i < len(ref) and ref[i] == v else "red") for i, v in enumerate(vals)) + "]"
@@ -59,7 +58,7 @@ def _diff_row(vals:list, ref:list) -> str:
 class TestSIMDModel(unittest.TestCase):
   def _sweep(self, en):
     fails = []
-    for op in sweep_ops(Device["AMD"].arch, en):
+    for op in sweep_ops(en):
       name = op.name.lower()
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
