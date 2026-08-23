@@ -1,7 +1,7 @@
 # SQTT trace encoder for the emulator (the decoder lives in tinygrad/renderer/amd/sqtt.py).
 from __future__ import annotations
 from tinygrad.renderer.amd.dsl import Inst
-from tinygrad.renderer.amd.sqtt import (_build_decode_tables, PACKET_TYPES_RDNA3, PacketType, InstOp, AluSrc, MemSrc,
+from tinygrad.renderer.amd.sqtt import (_build_decode_tables, PACKET_TYPES_RDNA3, PacketType, InstOp, AluSrc, MemSrc, DISPATCH_TO_EXEC,
                                         LAYOUT_HEADER, WAVESTART, WAVEEND, INST, IMMEDIATE, VALUINST, ALUEXEC, VMEMEXEC,
                                         TS_DELTA_SHORT)
 
@@ -23,14 +23,12 @@ def _emit_at(nibbles: list[int], last: int, pkt_cls: type[PacketType], cycle: in
 
 _EXEC_SRC = {"SALU":(ALUEXEC, AluSrc.SALU), "VALU":(ALUEXEC, AluSrc.VALU),
              "LDS":(VMEMEXEC, MemSrc.LDS), "VMEM":(VMEMEXEC, MemSrc.VMEM)}
-_EXEC_QUEUE = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
-               "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
 
 SQTT_FRONTEND_CYCLES = 4
 
 def pipe_of(name: str) -> tuple[str|None, int]:
   import re
-  queue = _EXEC_QUEUE.get(name.replace("OTHER_", "").split("_")[0])
+  queue = DISPATCH_TO_EXEC.get(name.replace("OTHER_", "").split("_")[0])
   return queue, (int(m.group(1)) if (m:=re.match(r".*_(\d+)$", name)) else 1)
 
 _EXTRA_READ = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset0_", "s_bitset1_", "s_movrels")

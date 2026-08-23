@@ -36,6 +36,9 @@ def add_other_simd(cls:type[Enum], ranges:list[tuple[str, int, int, int]]) -> No
       obj._value_ = value
       obj._name_ = f"OTHER_{category}_{value - start + base_cycle}"
 
+DISPATCH_TO_EXEC = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
+                    "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
+
 class InstOp(Enum):
   """SQTT instruction operation types for RDNA3 (gfx1100).
 
