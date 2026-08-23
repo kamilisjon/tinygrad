@@ -1976,9 +1976,7 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
                          ctypes.c_uint64(scratch_buf._buf.va_addr if scratch_buf else 0),
                          ctypes.c_uint64(st.accvgpr_buf._buf.va_addr)]))
     done = [False] * len(waves)
-    # timing model: one instruction dispatched per cycle, each reaching its pipe after that opcode's
-    # dispatch->exec or when the pipe frees, whichever is later, and holding it for its initiation
-    # interval. queue backpressure and dependency stalls are not modelled yet.
+
     cycle, pipe_free = 0, {}
     for _ in range(10_000_000):
       if all(done): return
@@ -1989,7 +1987,6 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
           pc = st.pc
           if pc == ENDPGM_PC:
             done[wi] = True
-            # the wave cannot retire before the pipes it fed have drained
             if tracing: sqtt_finish(wi, max(cycle, *pipe_free.values()) if pipe_free else cycle)
             break
           fxn, globals_list, is_barrier, inst = _ensure_compiled(pc)

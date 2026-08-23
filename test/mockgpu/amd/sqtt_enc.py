@@ -1,7 +1,4 @@
 # SQTT trace encoder for the emulator (the decoder lives in tinygrad/renderer/amd/sqtt.py).
-# run_asm records (cycle, packet) events as instructions execute and finalize() sorts them by cycle
-# before encoding, because dispatch and exec of different instructions interleave in time.
-# finished traces end up in emu.sqtt_traces.
 from __future__ import annotations
 from tinygrad.renderer.amd.dsl import Inst
 from tinygrad.renderer.amd.sqtt import (_build_decode_tables, PACKET_TYPES_RDNA3, PacketType, InstOp, AluSrc, MemSrc,
@@ -15,8 +12,6 @@ def _emit_nibbles(nibbles: list[int], pkt_cls: type[PacketType], **kwargs):
   for k, v in kwargs.items(): raw = pkt_cls.__dict__[k].set(raw, v)
   nibbles.extend((raw >> (i * 4)) & 0xF for i in range(_NIB_COUNTS[pkt_cls]))
 
-# a packet's own delta field is only 2-3 bits wide, so longer gaps are carried by standalone
-# TS_DELTA_SHORT packets first (each encodes 4..19 cycles) and the remainder goes in the packet
 def _emit_at(nibbles: list[int], last: int, pkt_cls: type[PacketType], cycle: int, **kwargs) -> int:
   rem = cycle - last
   assert rem >= 0, f"cycle went backwards: {cycle} < {last}"
@@ -26,38 +21,18 @@ def _emit_at(nibbles: list[int], last: int, pkt_cls: type[PacketType], cycle: in
   _emit_nibbles(nibbles, pkt_cls, delta=rem, **kwargs)
   return cycle
 
-# which exec queue an instruction retires from, and how many cycles it holds that pipe. the
-# occupancy is the trailing number in the InstOp name (VALUT_4 is quarter rate, f64 is 1/16), the
-# same convention viz uses to size exec blocks. branches have no exec packet at all.
 _EXEC_SRC = {"SALU":(ALUEXEC, AluSrc.SALU), "VALU":(ALUEXEC, AluSrc.VALU),
              "LDS":(VMEMEXEC, MemSrc.LDS), "VMEM":(VMEMEXEC, MemSrc.VMEM)}
 _EXEC_QUEUE = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
                "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
 
-SQTT_FRONTEND_CYCLES = 4  # pipes with no measured model yet
+SQTT_FRONTEND_CYCLES = 4
 
 def pipe_of(name: str) -> tuple[str|None, int]:
   import re
   queue = _EXEC_QUEUE.get(name.replace("OTHER_", "").split("_")[0])
   return queue, (int(m.group(1)) if (m:=re.match(r".*_(\d+)$", name)) else 1)
 
-# dispatch_to_exec is the cycles from an instruction being enqueued to its ALUEXEC packet, and the
-# initiation interval is how often the worker takes a new one. both are composed from properties of
-# the opcode, not tabulated per opcode. measured on gfx1102 over every SALU opcode the device
-# implements, by test/amd/test_simd_model.py:
-#   dispatch_to_exec = 2, +2 if the instruction needs a register read that is not a plain operand
-#                      (its own destination, or an M0 indexed source), +1 if it multiplies
-#   interval         = 2 if it multiplies, or if it reads two sgpr sources that each fit in one
-#                      register; otherwise 1
-# the s_pack family fixes what "fits in one register" means: its sources are 16 bit fields, but each
-# still costs a whole register read, and it measures 2 like the 32 bit two source opcodes.
-# the 64 bit siblings are the surprise: s_and_b64 sustains 1/cycle where s_and_b32 sustains 1 per 2,
-# and the same holds for or/xor/nand/nor/xnor/lshl/lshr/ashr/bfe/cmp/cselect. s_bfm_b64 identifies
-# the mechanism: 64 bit destination but 32 bit sources, and it reads 2 like the 32 bit ops. so the
-# cost is in the source reads, not the width of the result.
-# s_movk_i32 is the control for the +2 dispatch_to_exec term: it writes sdst without reading it, and
-# is the only SOPK opcode at dispatch_to_exec 2.
-# OPERANDS marks sdst the same whether it is read or written, so the extra-read set is listed.
 _EXTRA_READ = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset0_", "s_bitset1_", "s_movrels")
 
 def salu_timing(op) -> tuple[int, int]:
@@ -123,7 +98,6 @@ def make_encoder():
 
   def _rec(cycle: int, pkt_cls: type[PacketType], **kw): events.append((cycle, len(events), pkt_cls, kw))
 
-  # returns (exec queue, dispatch->exec, occupancy in cycles) so the caller can schedule the exec packet
   def emit(wave_id: int, inst: Inst, branch_taken: bool|None, cycle: int) -> tuple[str|None, int, int]:
     w = wave_id & 0x1F
     if wave_id not in started:
@@ -138,13 +112,11 @@ def make_encoder():
       else: name = InstOp.SALU
       _rec(cycle, INST, wave=w, op=name)
     elif issubclass(inst_type, _VALU):
-      if (op := _valu_op(op_name)) is None: _rec(cycle, VALUINST, wave=w); name = "VALUINST"  # type: ignore[assignment]
+      if (op := _valu_op(op_name)) is None: _rec(cycle, VALUINST, wave=w); name = "VALUINST"
       else: _rec(cycle, INST, wave=w, op=op); name = op
     elif issubclass(inst_type, _SMEM): _rec(cycle, INST, wave=w, op=(name:=InstOp.SMEM_RD))
     else: _rec(cycle, INST, wave=w, op=(name:=_mem_op(inst_type, op_name)))
     queue, occupancy = pipe_of(name if isinstance(name, str) else name.name)
-    # the SALU is the one pipe with a measured per opcode model, everything else is still the flat
-    # frontend depth and whatever rate its InstOp name encodes
     if queue == "SALU" and hasattr(inst, "op"): return (queue, *salu_timing(inst.op))
     return queue, SQTT_FRONTEND_CYCLES, occupancy
 

@@ -1,20 +1,3 @@
-# Tests of our mental model of one RDNA3 SIMD against real hardware.
-#
-# These are not regression tests for tinygrad. The sweep runs one kernel per opcode on hardware and
-# on the emulator and requires the two traces to be identical, so the model of the SIMD lives in the
-# emulator rather than being restated here. They need a real AMD GPU and skip everywhere else, so
-# they never run in CI.
-#
-# A failure here means the emulator or the model is wrong, not that the test is. Do not loosen an
-# assertion to make it pass: fix the emulator, or change the model and record what refuted it.
-#
-# The model: each pipe (SALU, VALU, LDS, VMEM) is a FIFO queue feeding a worker.
-#   dispatch  the wave put the instruction in the queue      SQTT INST / VALUINST packet
-#   exec      the worker took it out and started on it       SQTT ALUEXEC / VMEMEXEC packet
-# There is no completion event, so nothing here can measure how long an instruction runs for.
-# The scope is deliberately narrow: one opcode per kernel, repeated, nothing else in flight. Kernel
-# shapes the sweep cannot reach (a lone instruction, an idle queue mid-wave, mixed opcodes) are not
-# covered and want their own kernels when the time comes.
 import unittest
 from tinygrad import Device
 from tinygrad.helpers import colored, DEBUG
@@ -31,6 +14,10 @@ from test.amd.helpers import times_of, execs_of, insts_of
 assert "MOCK" not in type(Device["AMD"].iface).__name__, "needs real hardware, the emulator is under test"
 assert TARGET_TO_ARCH[Device["AMD"].arch] == "rdna3", "only rdna3"
 
+# Each pipe (SALU, VALU, LDS, VMEM) is a FIFO queue feeding a worker.
+#   dispatch  the wave put the instruction in the queue
+#   exec      the worker took it out and started on it
+
 def _kernel(name:str, insts:list):
   def fxn(A:UOp) -> UOp:
     threads, wg = UOp.special(32, "lidx0"), UOp.special(1, "gidx0")
@@ -38,31 +25,15 @@ def _kernel(name:str, insts:list):
     return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=x) for x in insts]))))
   return fxn
 
-# ── SALU sweep ───────────────────────────────────────────────────────────────────────────────────
-# One kernel per instruction, holding nothing but that instruction SWEEP_REPEATS times, each writing
-# a different destination so the repeats are independent. The wave starts with an empty queue, so the
-# first one measures dispatch_to_exec; the spacing between their execs measures how fast the worker takes new
-# work. No drain is needed: the kernel is the block.
-# a wave prefetches at most 3 instruction cache lines (3*64 bytes) ahead of the pc plus the line it
-# is on, so 256 bytes = 64 instructions of straight line code run before it catches the prefetcher
-# and stalls ~235 cycles for a real fetch. keep the whole kernel under that and the stall never
-# happens, instead of landing mid block and corrupting whichever repeat it hits.
 SWEEP_REPEATS, SWEEP_BLOCKS = 36, 2
 assert SWEEP_REPEATS + 1 <= 64, "kernel would outrun the prefetcher"
-# sources sit below the destinations and are shared by every repeat. putting them above instead
-# makes the base scale with SWEEP_REPEATS and silently run off the end of the sgpr file. an opcode
-# reads at most two 64 bit sources, so four registers cover every one of them, and they start above
-# s[0:1] to leave the kernarg pointer alone. 64 bit destinations take two registers each, and
-# s[0]..s[105] is the whole file, of which the top pair is left free for vcc.
 _SWEEP_SRC, _SWEEP_DST = 4, 8
 assert _SWEEP_DST + 2*SWEEP_REPEATS <= 104, f"SWEEP_REPEATS={SWEEP_REPEATS} needs more sgprs than exist" 
 
-# every scalar ALU opcode except the ones that would not come back: anything touching the PC, EXEC,
-# hardware registers, or wave state. SOPP is control flow only and emits no exec packet.
 _UNSAFE = ("PC", "SAVEEXEC", "SETREG", "GETREG", "BRANCH", "CALL", "RFE", "ENDPGM", "TRAP",
            "SENDMSG", "SLEEP", "BARRIER", "WAITCNT", "NOP", "HALT", "PRIO", "ICACHE", "TTRACE",
            "WAKEUP", "PERFLEVEL", "VERSION", "CLAUSE", "DELAY", "WAIT", "MSG")
-# destinations walk upward from _SWEEP_DST so the repeats do not depend on each other
+
 def _sweep_inst(op, i:int):
   kwargs, sreg = {}, _SWEEP_SRC
   for field, (_fmt, width, kind) in OPERANDS[op].items():
@@ -74,10 +45,6 @@ def _sweep_inst(op, i:int):
       sreg += 2 if width == 64 else 1
   return getattr(r3, op.name.lower())(**kwargs)
 
-# keep an opcode only if this device really implements it. tinygrad's rdna3 enum is a union over
-# gfx11.0 and gfx11.5, so it contains scalar float ops (s_add_f32, s_cvt_*, ...) that gfx1102 has no
-# unit for: executing one raises sq_intr ILLEGAL_INST and hangs the queue. LLVM knows per target.
-# also require tinygrad to decode it back, since amd_decode must disassemble the whole kernel.
 def _sweep_ok(op, target:str) -> bool:
   if OPERANDS.get(op) is None or any(u in op.name for u in _UNSAFE): return False
   if not hasattr(r3, name:=op.name.lower()): return False
@@ -89,45 +56,26 @@ def _sweep_ok(op, target:str) -> bool:
 
 def sweep_ops(target:str, en) -> list: return sorted((m for m in en if _sweep_ok(m, target)), key=lambda m: m.name)
 
-# one row of the emulator's trace against hardware's, green where they agree
 def _diff_row(vals:list, ref:list) -> str:
   return "[" + ", ".join(colored(str(v), "green" if i < len(ref) and ref[i] == v else "red") for i, v in enumerate(vals)) + "]"
 
 class TestSIMDModel(unittest.TestCase):
-  # refuted by: hardware trials that disagree with each other, or an emulator trace that is not
-  # cycle for cycle what hardware produced
   def _sweep(self, en):
     fails = []
     for op in sweep_ops(Device["AMD"].arch, en):
       name = op.name.lower()
-      # one kernel holding one block, dispatched SWEEP_BLOCKS times, so every trial runs the same
-      # code at the same offset. the block is short enough that the prefetcher never runs dry.
-      # every trial is kept. a handful of opcodes read dispatch_to_exec 4 on trial 0 and 2 on the rest, and
-      # which ones they are changes between runs, so the first dispatch is not reproducible the way
-      # everything else here is. that is a finding, not noise to drop: do not add a warmup dispatch
-      # to hide it.
-      # TODO: explain it. a cold first dispatch would slow every opcode, not five of them, so the
-      # cause is something that varies per run. compare the full packet stream of trial 0 against
-      # trial 1 for one affected opcode.
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
       projs, raw, lib, arch, simd = capture_runs(_kernel(kname, block), kname, SWEEP_BLOCKS)
-      # the emulator runs the same instructions in this process and joins as the last trial. it is
-      # where the model lives, so the sweep does not restate it here: hardware and emulator either
-      # emit the same trace or they do not.
       try: emu, err = sram_scope(capture_emu(block), lib, arch, 0), None
-      except Exception as e: emu, err = None, repr(e)  # no pcode for this opcode, or it faulted
-
+      except Exception as e: emu, err = None, repr(e)
       was = len(fails)
       if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: hardware trials disagree with each other")
-      # trial 0 is the reference: whatever hardware did, the emulator has to reproduce exactly
       if emu is None: fails.append(f"{name}: emulator produced no trace, {err}")
       elif insts_of(emu) != insts_of(projs[0]): fails.append(f"{name}: emulator executed different instructions")
       elif (times_of(emu), execs_of(emu)) != (times_of(projs[0]), execs_of(projs[0])):
         fails.append(f"{name}: emulator timing differs from hardware")
       if (ok := len(fails) == was) and DEBUG < 1: continue
-
-      # only the opcodes that disagree are worth looking at, so the ones that match print under DEBUG
       n_exec = sum(isinstance(p, ALUEXEC) for p, _ in map_insts(raw[0][0], lib, arch, simd))
       print(f"\n  **** {name}" + (f"   <- {n_exec} ALUEXEC for {SWEEP_REPEATS} instructions, pairing unreliable"
                                    if n_exec != SWEEP_REPEATS else ""))
@@ -138,14 +86,10 @@ class TestSIMDModel(unittest.TestCase):
         blk = [(t, e) for t, e, _, _op in proj]
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
         gaps = [y[1]-x[1] for x, y in zip(blk, blk[1:]) if x[1] is not None and y[1] is not None]
-        # absolute cycles first, then the gaps between them. dispatch_to_exec is the vertical
-        # distance between the two rows, so it is the first exec time once both are anchored on 0.
         t0 = blk[0][0]
         rows = {"dispatch": [t - t0 for t, _ in blk], "exec": [None if e is None else e - t0 for _, e in blk],
                 "dispatch_to_exec": [None if e is None else e - t for t, e in blk],
                 "dispatch gaps": disp, "exec gaps": gaps}
-        # hardware trial 0 is the reference the emulator has to reproduce, so its rows print plain
-        # and the emulator's print green where they agree and red where they do not
         if b == 0: ref_rows = rows
         print(f"    {label if label != 'emu' else colored(label, 'green' if ok else 'red')}")
         for k, v in rows.items(): print(f"        {k:<16} " + (str(v) if label != "emu" else _diff_row(v, ref_rows[k])))

@@ -137,16 +137,11 @@ def llvm_filter_valid_asm(tests:list[tuple[str, bytes]], mcpu:str, mattr:str) ->
   # Invalid instructions produce 0 bytes; also filter where LLVM roundtrip doesn't match original
   return [(asm, data) for (asm, data), chunk in zip(tests, results) if len(chunk) > 0 and chunk == data]
 
-# ── SQTT capture and projection ──
-
-# link a trace to the exact binary that produced it via ProfileSQTTEvent.kern -> ProfileProgramEvent.tag,
-# the way viz and test_sqttmap do. matching on name alone can pick a stale build of an edited kernel.
 def _lib_for(kern:int|None, kname:str) -> bytes:
   prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
   if kern is not None:
     assert (e:=prgs.get(kern)) is not None and e.lib, f"no ProfileProgramEvent tagged {kern}"
     return e.lib
-  # the emulator emits no ProfileSQTTEvent, so there is no kern to link from
   assert (c:=[e for e in prgs.values() if e.name == kname and e.lib]), f"no ProfileProgramEvent for {kname}, is PROFILE=1 set?"
   return c[-1].lib
 
@@ -185,9 +180,6 @@ def project(blobs:list[bytes], lib:bytes, arch:str, simd:int):
     if p: return p
   return None
 
-# only one simd per se is instruction traced, and the dispatcher does not always put the wave on it:
-# even with a single CU enabled the two simds of that CU alternate between dispatches. so find the
-# traced simd once, then retry dispatches until n_runs of them actually landed on it.
 def capture_runs(fxn:Callable, kname:str, n_runs:int=1, max_dispatch:int=40):
   sel, projs, raw, lib, arch, seen = None, [], [], None, None, {}
   for _ in range(max_dispatch):
@@ -204,17 +196,9 @@ def capture_runs(fxn:Callable, kname:str, n_runs:int=1, max_dispatch:int=40):
     f"only {len(projs)}/{n_runs} dispatches landed on a traced simd in {max_dispatch} tries; last packets seen: {seen}"
   return projs, raw, lib, arch, sel
 
-# maps a dispatch packet's op category to the exec queue it will be retired from, same table viz uses
 _DISPATCH_TO_EXEC = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
                      "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
 
-# project a raw blob down to SRAM scope: one entry per executed instruction on the traced SIMD, as
-# (dispatch time, exec time, pc, op name). dispatch is when the wave issued it, exec is when the pipe
-# started it, and exec is None for ops with no exec packet (branches). exec packets carry no wave or
-# pc, they are matched to dispatches in issue order per exec queue.
-# WAVEEND carries a synthetic s_endpgm and is dropped; s_delay_alu/s_wait_alu emit no token at all.
-# pc and both times are made relative to the first entry: the absolute pc depends on where the elf
-# put .text, and the absolute time depends on when tracing armed relative to dispatch.
 def sram_scope(blob:bytes, lib:bytes, arch:str, simd:int=0) -> list[tuple[int, int|None, int, str]]:
   out: list[list] = []
   pending: dict[str, list[int]] = {}
@@ -239,15 +223,11 @@ def times_of(proj): return [t for t, _, _, _ in proj]
 def execs_of(proj): return [e for _, e, _, _ in proj]
 
 
-
-# run the same instructions on the emulator, in this process, whatever device is selected. the
-# emulator is a plain function over host memory, not a tinygrad backend, so it does not need
-# DEV=MOCKKFD and can be called while a real GPU is open. tracing is gated on PROFILE alone.
 def capture_emu(insts:list, n_lanes:int=32) -> bytes:
   import test.mockgpu.amd.emu as emu
   code = b"".join(i.to_bytes() for i in insts)
   buf = (ctypes.c_char * len(code)).from_buffer_copy(code)
-  args = (ctypes.c_uint64 * 1)(0)  # the kernels compared here touch no memory
+  args = (ctypes.c_uint64 * 1)(0)
   emu.sqtt_traces.clear()
   assert emu.run_asm(ctypes.addressof(buf), len(code), 1, 1, 1, n_lanes, 1, 1, ctypes.addressof(args)) == 0, "emulator rejected the kernel"
   assert emu.sqtt_traces, "emulator produced no SQTT trace, is PROFILE=1 set?"
