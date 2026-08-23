@@ -31,31 +31,6 @@ from test.amd.helpers import times_of, execs_of, insts_of
 assert "MOCK" not in type(Device["AMD"].iface).__name__, "needs real hardware, the emulator is under test"
 assert TARGET_TO_ARCH[Device["AMD"].arch] == "rdna3", "only rdna3"
 
-# dispatch_to_exec is the cycles from an instruction being enqueued to its ALUEXEC packet.
-# dispatch_to_exec and initiation interval are composed from properties of the opcode, not tabulated
-# per opcode. measured on gfx1102 over every SALU opcode the device implements:
-#   dispatch_to_exec = 2, +2 if the instruction needs a register read that is not a plain operand
-#              (its own destination, or an M0 indexed source), +1 if it multiplies
-#   interval         = 2 if it multiplies, or if it reads two sgpr sources that each fit in one register;
-#                      otherwise 1
-# the s_pack family fixes what "fits in one register" means: its sources are 16 bit fields, but each
-# still costs a whole register read, and it measures 2 like the 32 bit two source opcodes.
-# the 64 bit siblings are the surprise: s_and_b64 sustains 1/cycle where s_and_b32 sustains 1 per 2,
-# and the same holds for or/xor/nand/nor/xnor/lshl/lshr/ashr/bfe/cmp/cselect. s_bfm_b64 identifies
-# the mechanism: 64 bit destination but 32 bit sources, and it reads 2 like the 32 bit ops. so the
-# cost is in the source reads, not the width of the result.
-# s_movk_i32 is the control for the +2 dispatch_to_exec term: it writes sdst without reading it, and is the
-# only SOPK opcode at dispatch_to_exec 2.
-# OPERANDS marks sdst the same whether it is read or written, so the extra-read set is listed.
-_EXTRA_READ = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset0_", "s_bitset1_", "s_movrels")
-
-def salu_timing(op) -> tuple[int, int]:
-  srcs = [w for _f, (_fmt, w, k) in OPERANDS[op].items() if k.name == "OPR_SSRC"]
-  extra, mul = (n:=op.name.lower()).startswith(_EXTRA_READ), "_mul" in n
-  interval = 2 if (mul or (len(srcs) == 2 and max(srcs) <= 32)) else 1
-  return 2 + 2*extra + mul, interval
-
-
 def _kernel(name:str, insts:list):
   def fxn(A:UOp) -> UOp:
     threads, wg = UOp.special(32, "lidx0"), UOp.special(1, "gidx0")
@@ -72,7 +47,7 @@ def _kernel(name:str, insts:list):
 # is on, so 256 bytes = 64 instructions of straight line code run before it catches the prefetcher
 # and stalls ~235 cycles for a real fetch. keep the whole kernel under that and the stall never
 # happens, instead of landing mid block and corrupting whichever repeat it hits.
-SWEEP_REPEATS, SWEEP_BLOCKS, SWEEP_RAMP = 36, 2, 10
+SWEEP_REPEATS, SWEEP_BLOCKS = 36, 2
 assert SWEEP_REPEATS + 1 <= 64, "kernel would outrun the prefetcher"
 # sources sit below the destinations and are shared by every repeat. putting them above instead
 # makes the base scale with SWEEP_REPEATS and silently run off the end of the sgpr file. an opcode
@@ -119,9 +94,8 @@ def _diff_row(vals:list, ref:list) -> str:
   return "[" + ", ".join(colored(str(v), "green" if i < len(ref) and ref[i] == v else "red") for i, v in enumerate(vals)) + "]"
 
 class TestSIMDModel(unittest.TestCase):
-  # every SALU instruction should show the same dispatch_to_exec on an idle queue and the same
-  # initiation interval back to back. anything new is a discovery.
-  # refuted by: an opcode whose dispatch_to_exec or interval is not what salu_timing() says
+  # refuted by: hardware trials that disagree with each other, or an emulator trace that is not
+  # cycle for cycle what hardware produced
   def _sweep(self, en):
     fails = []
     for op in sweep_ops(Device["AMD"].arch, en):
@@ -148,20 +122,14 @@ class TestSIMDModel(unittest.TestCase):
       except Exception as e:  # no pcode for this opcode, or it faulted
         emu, err = None, repr(e)
         print("    " + colored(f"emu  no trace: {err}", "red"))
-      seen, want, ref_rows = set(), salu_timing(op), {}
+      ref_rows = {}
       for b, proj in enumerate(projs + ([emu] if emu else [])):
         label = "emu" if b == len(projs) else f"#{b}"
         blk = [(t, e) for t, e, _, _op in proj]
         # the emulator's own count is checked below, against hardware, not against the model
         if label != "emu": self.assertEqual(len(blk), SWEEP_REPEATS, f"{name} {label}: unexpected instruction count")
-        dispatch_to_exec = None if blk[0][1] is None else blk[0][1] - blk[0][0]
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
         gaps = [y[1]-x[1] for x, y in zip(blk, blk[1:]) if x[1] is not None and y[1] is not None]
-        # some opcodes run their first few at the normal rate before settling, so read the interval
-        # off the tail rather than off the ramp.
-        tail = gaps[SWEEP_RAMP:]
-        interval = max(set(tail), key=tail.count) if tail else None
-        if label != "emu": seen.add((dispatch_to_exec, interval))
         # absolute cycles first, then the gaps between them. dispatch_to_exec is the vertical
         # distance between the two rows, so it is the first exec time once both are anchored on 0.
         t0 = blk[0][0]
@@ -174,14 +142,13 @@ class TestSIMDModel(unittest.TestCase):
         hit = label != "emu" or all(rows[k] == ref_rows.get(k) for k in rows)
         print(f"    {label if label != 'emu' else colored(label, 'green' if hit else 'red')}")
         for k, v in rows.items(): print(f"        {k:<16} " + (str(v) if label != "emu" else _diff_row(v, ref_rows.get(k, []))))
-      if len(seen) > 1: fails.append(f"{name}: unstable across trials, {sorted(seen)}")
-      elif seen != {want}: fails.append(f"{name}: {seen.pop()}, expected {want}")
+      if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: hardware trials disagree with each other")
       # trial 0 is the reference: whatever hardware did, the emulator has to reproduce exactly
       if emu is None: fails.append(f"{name}: emulator produced no trace, {err}")
       elif insts_of(emu) != insts_of(projs[0]): fails.append(f"{name}: emulator executed different instructions")
       elif (times_of(emu), execs_of(emu)) != (times_of(projs[0]), execs_of(projs[0])):
         fails.append(f"{name}: emulator timing differs from hardware")
-    self.assertFalse(fails, f"{len(fails)} opcodes disagree with salu_timing() or with the emulator:\n" + "\n".join(fails))
+    self.assertFalse(fails, f"{len(fails)} opcodes disagree with the emulator or with themselves:\n" + "\n".join(fails))
 
   def test_sop1(self): self._sweep(e3.SOP1Op)
   def test_sop2(self): self._sweep(e3.SOP2Op)

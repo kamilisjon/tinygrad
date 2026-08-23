@@ -34,10 +34,38 @@ _EXEC_SRC = {"SALU":(ALUEXEC, AluSrc.SALU), "VALU":(ALUEXEC, AluSrc.VALU),
 _EXEC_QUEUE = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
                "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
 
+SQTT_FRONTEND_CYCLES = 4  # pipes with no measured model yet
+
 def pipe_of(name: str) -> tuple[str|None, int]:
   import re
   queue = _EXEC_QUEUE.get(name.replace("OTHER_", "").split("_")[0])
   return queue, (int(m.group(1)) if (m:=re.match(r".*_(\d+)$", name)) else 1)
+
+# dispatch_to_exec is the cycles from an instruction being enqueued to its ALUEXEC packet, and the
+# initiation interval is how often the worker takes a new one. both are composed from properties of
+# the opcode, not tabulated per opcode. measured on gfx1102 over every SALU opcode the device
+# implements, by test/amd/test_simd_model.py:
+#   dispatch_to_exec = 2, +2 if the instruction needs a register read that is not a plain operand
+#                      (its own destination, or an M0 indexed source), +1 if it multiplies
+#   interval         = 2 if it multiplies, or if it reads two sgpr sources that each fit in one
+#                      register; otherwise 1
+# the s_pack family fixes what "fits in one register" means: its sources are 16 bit fields, but each
+# still costs a whole register read, and it measures 2 like the 32 bit two source opcodes.
+# the 64 bit siblings are the surprise: s_and_b64 sustains 1/cycle where s_and_b32 sustains 1 per 2,
+# and the same holds for or/xor/nand/nor/xnor/lshl/lshr/ashr/bfe/cmp/cselect. s_bfm_b64 identifies
+# the mechanism: 64 bit destination but 32 bit sources, and it reads 2 like the 32 bit ops. so the
+# cost is in the source reads, not the width of the result.
+# s_movk_i32 is the control for the +2 dispatch_to_exec term: it writes sdst without reading it, and
+# is the only SOPK opcode at dispatch_to_exec 2.
+# OPERANDS marks sdst the same whether it is read or written, so the extra-read set is listed.
+_EXTRA_READ = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset0_", "s_bitset1_", "s_movrels")
+
+def salu_timing(op) -> tuple[int, int]:
+  from tinygrad.renderer.amd.dsl import OPERANDS
+  if (ops := OPERANDS.get(op)) is None: return SQTT_FRONTEND_CYCLES, 1
+  srcs = [w for _f, (_fmt, w, k) in ops.items() if k.name == "OPR_SSRC"]
+  extra, mul = (n:=op.name.lower()).startswith(_EXTRA_READ), "_mul" in n
+  return 2 + 2*extra + mul, 2 if (mul or (len(srcs) == 2 and max(srcs) <= 32)) else 1
 
 def make_encoder():
   """Build an SQTT trace encoder for the emulator. Returns (emit, emit_exec, finish, finalize)."""
@@ -95,16 +123,16 @@ def make_encoder():
 
   def _rec(cycle: int, pkt_cls: type[PacketType], **kw): events.append((cycle, len(events), pkt_cls, kw))
 
-  # returns (exec queue, occupancy in cycles) so the caller can schedule the matching exec packet
-  def emit(wave_id: int, inst: Inst, branch_taken: bool|None, cycle: int) -> tuple[str|None, int]:
+  # returns (exec queue, dispatch->exec, occupancy in cycles) so the caller can schedule the exec packet
+  def emit(wave_id: int, inst: Inst, branch_taken: bool|None, cycle: int) -> tuple[str|None, int, int]:
     w = wave_id & 0x1F
     if wave_id not in started:
       _rec(cycle, WAVESTART, simd=0, wgp=0, wave=w, id7=wave_id)
       started.add(wave_id)
     inst_type, inst_op, op_name = type(inst), inst.op.value if hasattr(inst, 'op') else 0, inst.op.name if hasattr(inst, 'op') else ""
     if issubclass(inst_type, _SOPP):
-      if inst_op in _SOPP_SKIP: return None, 0
-      if inst_op in _SOPP_IMMEDIATE: _rec(cycle, IMMEDIATE, wave=w); return None, 0
+      if inst_op in _SOPP_SKIP: return None, 0, 0
+      if inst_op in _SOPP_IMMEDIATE: _rec(cycle, IMMEDIATE, wave=w); return None, 0, 0
       if inst_op in _SOPP_BARRIER: name = InstOp.BARRIER
       elif inst_op in _SOPP_BRANCH: name = InstOp.JUMP if branch_taken else InstOp.JUMP_NO
       else: name = InstOp.SALU
@@ -114,7 +142,11 @@ def make_encoder():
       else: _rec(cycle, INST, wave=w, op=op); name = op
     elif issubclass(inst_type, _SMEM): _rec(cycle, INST, wave=w, op=(name:=InstOp.SMEM_RD))
     else: _rec(cycle, INST, wave=w, op=(name:=_mem_op(inst_type, op_name)))
-    return pipe_of(name if isinstance(name, str) else name.name)
+    queue, occupancy = pipe_of(name if isinstance(name, str) else name.name)
+    # the SALU is the one pipe with a measured per opcode model, everything else is still the flat
+    # frontend depth and whatever rate its InstOp name encodes
+    if queue == "SALU" and hasattr(inst, "op"): return (queue, *salu_timing(inst.op))
+    return queue, SQTT_FRONTEND_CYCLES, occupancy
 
   def emit_exec(queue: str, cycle: int):
     pkt_cls, src = _EXEC_SRC[queue]
