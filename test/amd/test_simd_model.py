@@ -98,7 +98,7 @@ def _kernel(name:str, insts:list):
 # is on, so 256 bytes = 64 instructions of straight line code run before it catches the prefetcher
 # and stalls ~235 cycles for a real fetch. keep the whole kernel under that and the stall never
 # happens, instead of landing mid block and corrupting whichever repeat it hits.
-SWEEP_REPEATS, SWEEP_BLOCKS, SWEEP_RAMP = 36, 3, 10
+SWEEP_REPEATS, SWEEP_BLOCKS, SWEEP_RAMP = 36, 2, 10
 assert SWEEP_REPEATS + 1 <= 64, "kernel would outrun the prefetcher"
 # sources sit below the destinations and are shared by every repeat. putting them above instead
 # makes the base scale with SWEEP_REPEATS and silently run off the end of the sgpr file. an opcode
