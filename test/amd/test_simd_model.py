@@ -17,6 +17,7 @@
 # covered and want their own kernels when the time comes.
 import unittest
 from tinygrad import Device
+from tinygrad.helpers import colored
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.renderer.amd.dsl import s, OPERANDS
 from tinygrad.renderer.amd.sqtt import map_insts, ALUEXEC
@@ -145,6 +146,10 @@ def sweep_ops(target:str) -> list[str]: return sorted(n for n in _SOP_OPS if _sw
 
 def _sweep_block(name:str) -> list: return [_sweep_inst(name, i) for i in range(SWEEP_REPEATS)]
 
+# one row of the emulator's trace against hardware's, green where they agree
+def _diff_row(vals:list, ref:list) -> str:
+  return "[" + ", ".join(colored(str(v), "green" if i < len(ref) and ref[i] == v else "red") for i, v in enumerate(vals)) + "]"
+
 @unittest.skipUnless(Device.DEFAULT == "AMD", "requires AMD device")
 class TestSIMDModel(unittest.TestCase):
   # open the device once: a failed open leaves its flock held, so retrying per test buries the real
@@ -179,7 +184,7 @@ class TestSIMDModel(unittest.TestCase):
       # emit the same trace or they do not.
       try: emu = sram_scope(capture_emu(block), lib, arch, 0)
       except Exception as e: emu, err = None, repr(e)  # no pcode for this opcode, or it faulted
-      seen, want = set(), salu_timing(name)
+      seen, want, ref_rows = set(), salu_timing(name), {}
       for b, proj in enumerate(projs + ([emu] if emu else [])):
         label = "emu" if b == len(projs) else f"#{b}"
         blk = [(t, e) for t, e, _, _op in proj]
@@ -196,12 +201,15 @@ class TestSIMDModel(unittest.TestCase):
         # absolute cycles first, then the gaps between them. dispatch_to_exec is the vertical
         # distance between the two rows, so it is the first exec time once both are anchored on 0.
         t0 = blk[0][0]
-        print(f"    {label}")
-        print(f"        dispatch {[t - t0 for t, _ in blk]}")
-        print(f"        exec     {[None if e is None else e - t0 for _, e in blk]}")
-        print(f"        d to e   {[None if e is None else e - t for t, e in blk]}")
-        print(f"        d gaps   {disp}")
-        print(f"        e gaps   {gaps}")
+        rows = {"dispatch": [t - t0 for t, _ in blk], "exec": [None if e is None else e - t0 for _, e in blk],
+                "dispatch_to_exec": [None if e is None else e - t for t, e in blk],
+                "dispatch gaps": disp, "exec gaps": gaps}
+        # hardware trial 0 is the reference the emulator has to reproduce, so its rows print plain
+        # and the emulator's print green where they agree and red where they do not
+        if b == 0: ref_rows = rows
+        hit = label != "emu" or all(rows[k] == ref_rows.get(k) for k in rows)
+        print(f"    {label if label != 'emu' else colored(label, 'green' if hit else 'red')}")
+        for k, v in rows.items(): print(f"        {k:<16} " + (str(v) if label != "emu" else _diff_row(v, ref_rows.get(k, []))))
       if len(seen) > 1: fails.append(f"{name}: unstable across trials, {sorted(seen)}")
       elif seen != {want}: fails.append(f"{name}: {seen.pop()}, expected {want}")
       # trial 0 is the reference: whatever hardware did, the emulator has to reproduce exactly
