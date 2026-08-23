@@ -25,12 +25,15 @@ from test.amd.helpers import TARGET_TO_ARCH, llvm_disasm, get_mattr, capture_run
 # dispatch->exec with an empty queue and an idle worker is not one number: the first instruction of
 # a wave costs more than a later one. measured on gfx1102 with s_add_i32.
 FIRST_INST_CYCLES = 4  # first instruction of the wave
+QUEUE_CYCLES = 2       # any later one, with the queue drained
 # transit and initiation interval are composed from properties of the opcode, not tabulated per
 # opcode. measured on gfx1102 over every SALU opcode the device implements:
 #   transit  = 2, +2 if the instruction needs a register read that is not a plain operand (its own
 #              destination, or an M0 indexed source), +1 if it multiplies
-#   interval = 2 if it multiplies, or if it reads exactly two 32 bit sgpr sources; 8 for the wrexec
-#              family; otherwise 1
+#   interval = 2 if it multiplies, or if it reads two sgpr sources that each fit in one register;
+#              otherwise 1
+# the s_pack family fixes what "fits in one register" means: its sources are 16 bit fields, but each
+# still costs a whole register read, and it measures 2 like the 32 bit two source opcodes.
 # the 64 bit siblings are the surprise: s_and_b64 sustains 1/cycle where s_and_b32 sustains 1 per 2,
 # and the same holds for or/xor/nand/nor/xnor/lshl/lshr/ashr/bfe/cmp/cselect. s_bfm_b64 identifies
 # the mechanism: 64 bit destination but 32 bit sources, and it reads 2 like the 32 bit ops. so the
@@ -43,7 +46,7 @@ _EXTRA_READ = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset
 def salu_timing(name:str) -> tuple[int, int]:
   srcs = [w for _f, (_fmt, w, k) in OPERANDS[_SOP_OPS[name]].items() if k.name == "OPR_SSRC"]
   extra, mul = name.startswith(_EXTRA_READ), "_mul" in name
-  interval = 2 if (mul or srcs == [32, 32]) else 1
+  interval = 2 if (mul or (len(srcs) == 2 and max(srcs) <= 32)) else 1
   return 2 + 2*extra + mul, interval
 
 # the sgpr file is banked and two reads landing in the same bank cost one extra cycle. these read
@@ -216,6 +219,13 @@ class TestSIMDModel(unittest.TestCase):
     for name in sweep_ops(Device["AMD"].arch):
       # one kernel holding one block, dispatched SWEEP_BLOCKS times, so every trial runs the same
       # code at the same offset. the block is short enough that the prefetcher never runs dry.
+      # every trial is kept. a handful of opcodes read transit 4 on trial 0 and 2 on the rest, and
+      # which ones they are changes between runs, so the first dispatch is not reproducible the way
+      # everything else here is. that is a finding, not noise to drop: do not add a warmup dispatch
+      # to hide it.
+      # TODO: explain it. a cold first dispatch would slow every opcode, not five of them, so the
+      # cause is something that varies per run. compare the full packet stream of trial 0 against
+      # trial 1 for one affected opcode.
       kname = f"custom_salu_{name}"
       kernel = _kernel(kname, _sweep_block(name) + [s_endpgm()], register=False)
       projs, raw, lib, arch, simd = capture_runs(kernel, kname, SWEEP_BLOCKS)
