@@ -137,11 +137,6 @@ def llvm_filter_valid_asm(tests:list[tuple[str, bytes]], mcpu:str, mattr:str) ->
   # Invalid instructions produce 0 bytes; also filter where LLVM roundtrip doesn't match original
   return [(asm, data) for (asm, data), chunk in zip(tests, results) if len(chunk) > 0 and chunk == data]
 
-def _lib_for(kern:int) -> bytes:
-  prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
-  assert (e:=prgs.get(kern)) is not None and e.lib, f"no ProfileProgramEvent tagged {kern}, is PROFILE=1 set?"
-  return e.lib
-
 def pkt_hist(blobs:list[bytes]) -> dict[str, int]:
   from tinygrad.renderer.amd.sqtt import decode
   import collections
@@ -161,7 +156,9 @@ def capture(fxn:Callable, n_runs:int=1, simd_sel:int=0) -> tuple[list[list[bytes
     assert evs, "hardware produced no instruction-traced SQTT events, is SQTT=1 set?"
     kern = evs[0].kern
     runs.append([e.blob for e in evs])
-  return runs, _lib_for(kern), Device["AMD"].arch
+  prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
+  assert (prg:=prgs.get(kern)) is not None and prg.lib, f"no ProfileProgramEvent tagged {kern}, is PROFILE=1 set?"
+  return runs, prg.lib, Device["AMD"].arch
 
 def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
   sel, projs, lib, arch, seen = None, [], None, None, {}
