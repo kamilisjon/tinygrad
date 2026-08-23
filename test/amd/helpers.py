@@ -165,9 +165,7 @@ def capture(fxn:Callable, n_runs:int=1, simd_sel:int=0) -> tuple[list[list[bytes
 
 def project(blobs:list[bytes], lib:bytes, arch:str, simd:int):
   for b in blobs:
-    try: p = sram_scope(b, lib, arch, simd)
-    except KeyError: continue
-    if p: return p
+    if p:=sram_scope(b, lib, arch, simd): return p
   return None
 
 def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):

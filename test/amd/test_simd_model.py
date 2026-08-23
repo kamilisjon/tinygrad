@@ -47,11 +47,9 @@ def _sweep_inst(op, i:int):
 def _sweep_ok(op, target:str) -> bool:
   if OPERANDS.get(op) is None or any(u in op.name for u in _UNSAFE): return False
   if not hasattr(r3, name:=op.name.lower()): return False
-  try:
-    inst = _sweep_inst(op, 0)
-    if repr(decode_inst(inst.to_bytes(), "rdna3")) != repr(inst): return False
-    return llvm_disasm(inst.to_bytes(), target, get_mattr("rdna3"))[0].split()[0] == name
-  except (TypeError, ValueError, KeyError, IndexError): return False  # opcode we cannot build or decode
+  inst = _sweep_inst(op, 0)
+  if repr(decode_inst(inst.to_bytes(), "rdna3")) != repr(inst): return False
+  return llvm_disasm(inst.to_bytes(), target, get_mattr("rdna3"))[0].split()[0] == name
 
 def sweep_ops(target:str, en) -> list: return sorted((m for m in en if _sweep_ok(m, target)), key=lambda m: m.name)
 
@@ -66,18 +64,15 @@ class TestSIMDModel(unittest.TestCase):
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
       projs, lib, arch = capture_runs(_kernel(kname, block), SWEEP_BLOCKS)
-      try: emu = sram_scope(capture_emu(block), lib, arch, 0)
-      except Exception as e: emu, err = None, repr(e)
+      emu = sram_scope(capture_emu(block), lib, arch, 0)
       was = len(fails)
       if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: hardware trials disagree with each other")
-      if emu is None: fails.append(f"{name}: emulator produced no trace, {err}")
-      elif insts_of(emu) != insts_of(projs[0]): fails.append(f"{name}: emulator executed different instructions")
+      if insts_of(emu) != insts_of(projs[0]): fails.append(f"{name}: emulator executed different instructions")
       elif (times_of(emu), execs_of(emu)) != (times_of(projs[0]), execs_of(projs[0])):
         fails.append(f"{name}: emulator timing differs from hardware")
       if (ok := len(fails) == was) and DEBUG < 1: continue
       print(f"\n  **** {name}")
-      if emu is None: print("    " + colored(f"emu  no trace: {err}", "red"))
-      for b, proj in enumerate(projs + ([emu] if emu else [])):
+      for b, proj in enumerate(projs + [emu]):
         is_emu = b == len(projs)
         blk = [(t, e) for t, e, _, _op in proj]
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
