@@ -23,8 +23,6 @@ def _emit_at(nibbles: list[int], last: int, pkt_cls: type[PacketType], cycle: in
 _EXEC_SRC = {"SALU":(ALUEXEC, AluSrc.SALU), "VALU":(ALUEXEC, AluSrc.VALU),
              "LDS":(VMEMEXEC, MemSrc.LDS), "VMEM":(VMEMEXEC, MemSrc.VMEM)}
 
-SQTT_FRONTEND_CYCLES = 4
-
 def pipe_of(name: str) -> tuple[str|None, int]:
   import re
   queue = DISPATCH_TO_EXEC.get(name.replace("OTHER_", "").split("_")[0])
@@ -34,7 +32,7 @@ _EXTRA_READ = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset
 
 def salu_timing(op) -> tuple[int, int]:
   from tinygrad.renderer.amd.dsl import OPERANDS
-  if (ops := OPERANDS.get(op)) is None: return SQTT_FRONTEND_CYCLES, 1
+  if (ops := OPERANDS.get(op)) is None: return 2, 1
   srcs = [w for _f, (_fmt, w, k) in ops.items() if k.name == "OPR_SSRC"]
   extra, mul = (n:=op.name.lower()).startswith(_EXTRA_READ), "_mul" in n
   return 2 + 2*extra + mul, 2 if (mul or (len(srcs) == 2 and max(srcs) <= 32)) else 1
@@ -115,7 +113,7 @@ def make_encoder():
     else: _rec(cycle, INST, wave=w, op=(name:=_mem_op(inst_type, op_name)))
     queue, occupancy = pipe_of(name if isinstance(name, str) else name.name)
     if queue == "SALU" and hasattr(inst, "op"): return (queue, *salu_timing(inst.op))
-    return queue, SQTT_FRONTEND_CYCLES, occupancy
+    return queue, occupancy, occupancy
 
   def emit_exec(queue: str, cycle: int):
     pkt_cls, src = _EXEC_SRC[queue]
