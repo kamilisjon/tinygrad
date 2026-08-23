@@ -178,10 +178,8 @@ def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
     f"only {len(projs)}/{n_runs} dispatches landed on a traced simd in {max_dispatch} tries; last packets seen: {seen}"
   return projs, lib, arch
 
-_DISPATCH_TO_EXEC = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
-                     "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
-
 def sram_scope(blob:bytes, lib:bytes, arch:str) -> list[tuple[int, int|None, int, str]]:
+  from test.mockgpu.amd.sqtt_enc import pipe_of
   out: list[list] = []
   pending: dict[str, list[int]] = {}
   for p, info in map_insts(blob, lib, arch):
@@ -192,7 +190,7 @@ def sram_scope(blob:bytes, lib:bytes, arch:str) -> list[tuple[int, int|None, int
     if info is None or info.inst.op_name == "S_ENDPGM": continue
     if isinstance(p, (INST, VALUINST)):
       name = p.op.name if isinstance(p, INST) else "VALUINST"
-      if (et:=_DISPATCH_TO_EXEC.get(name.replace("OTHER_", "").split("_")[0])) is not None:
+      if (et:=pipe_of(name)[0]) is not None:
         pending.setdefault(et, []).append(len(out))
     out.append([p._time, None, info.pc, info.inst.op_name])
   if not out: return []
