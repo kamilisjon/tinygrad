@@ -145,7 +145,7 @@ def _sweep_ok(name:str, target:str) -> bool:
     return llvm_disasm(inst.to_bytes(), target, get_mattr("rdna3"))[0].split()[0] == name
   except (TypeError, ValueError, KeyError, IndexError): return False  # opcode we cannot build or decode
 
-def sweep_ops(target:str) -> list[str]: return sorted(n for n in _SOP_OPS if _sweep_ok(n, target))
+def sweep_ops(target:str, en) -> list[str]: return sorted(n for n in (m.name.lower() for m in en) if _sweep_ok(n, target))
 
 def _sweep_block(name:str) -> list: return [_sweep_inst(name, i) for i in range(SWEEP_REPEATS)]
 
@@ -157,9 +157,9 @@ class TestSIMDModel(unittest.TestCase):
   # every SALU instruction should show the same dispatch_to_exec on an idle queue and the same
   # initiation interval back to back. anything new is a discovery.
   # refuted by: an opcode whose dispatch_to_exec or interval is not what salu_timing() says
-  def test_salu_sweep(self):
+  def _sweep(self, en):
     fails = []
-    for name in sweep_ops(Device["AMD"].arch):
+    for name in sweep_ops(Device["AMD"].arch, en):
       # one kernel holding one block, dispatched SWEEP_BLOCKS times, so every trial runs the same
       # code at the same offset. the block is short enough that the prefetcher never runs dry.
       # every trial is kept. a handful of opcodes read dispatch_to_exec 4 on trial 0 and 2 on the rest, and
@@ -215,6 +215,11 @@ class TestSIMDModel(unittest.TestCase):
       elif (times_of(emu), execs_of(emu)) != (times_of(projs[0]), execs_of(projs[0])):
         fails.append(f"{name}: emulator timing differs from hardware")
     self.assertFalse(fails, f"{len(fails)} opcodes disagree with salu_timing() or with the emulator:\n" + "\n".join(fails))
+
+  def test_sop1(self): self._sweep(e3.SOP1Op)
+  def test_sop2(self): self._sweep(e3.SOP2Op)
+  def test_sopc(self): self._sweep(e3.SOPCOp)
+  def test_sopk(self): self._sweep(e3.SOPKOp)
 
 if __name__ == "__main__":
   unittest.main()
