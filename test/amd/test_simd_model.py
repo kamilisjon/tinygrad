@@ -28,6 +28,9 @@ from tinygrad.runtime.autogen.amd.rdna3.ins import *
 from test.amd.helpers import TARGET_TO_ARCH, llvm_disasm, get_mattr, capture_runs, capture_emu, sram_scope
 from test.amd.helpers import times_of, execs_of, insts_of
 
+assert "MOCK" not in type(Device["AMD"].iface).__name__, "needs real hardware, the emulator is under test"
+assert TARGET_TO_ARCH[Device["AMD"].arch] == "rdna3", "only rdna3"
+
 # dispatch_to_exec is the cycles from an instruction being enqueued to its ALUEXEC packet.
 # dispatch_to_exec and initiation interval are composed from properties of the opcode, not tabulated
 # per opcode. measured on gfx1102 over every SALU opcode the device implements:
@@ -150,15 +153,7 @@ def _sweep_block(name:str) -> list: return [_sweep_inst(name, i) for i in range(
 def _diff_row(vals:list, ref:list) -> str:
   return "[" + ", ".join(colored(str(v), "green" if i < len(ref) and ref[i] == v else "red") for i, v in enumerate(vals)) + "]"
 
-@unittest.skipUnless(Device.DEFAULT == "AMD", "requires AMD device")
 class TestSIMDModel(unittest.TestCase):
-  # open the device once: a failed open leaves its flock held, so retrying per test buries the real
-  # error under a lock error from the next attempt
-  @classmethod
-  def setUpClass(cls):
-    if "MOCK" in type(Device["AMD"].iface).__name__: raise unittest.SkipTest("needs real hardware, not the emulator")
-    if TARGET_TO_ARCH[Device["AMD"].arch] != "rdna3": raise unittest.SkipTest("only rdna3")
-
   # every SALU instruction should show the same dispatch_to_exec on an idle queue and the same
   # initiation interval back to back. anything new is a discovery.
   # refuted by: an opcode whose dispatch_to_exec or interval is not what salu_timing() says
