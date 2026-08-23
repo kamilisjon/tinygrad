@@ -22,24 +22,25 @@ from tinygrad.renderer.amd import decode_inst
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 from test.amd.helpers import TARGET_TO_ARCH, llvm_disasm, get_mattr, capture_runs, project, times_of, execs_of, insts_of
 
-# dispatch->exec with an empty queue and an idle worker is not one number: the first instruction of
-# a wave costs more than a later one. measured on gfx1102 with s_add_i32.
-FIRST_INST_CYCLES = 4  # first instruction of the wave
-QUEUE_CYCLES = 2       # any later one, with the queue drained
-# transit and initiation interval are composed from properties of the opcode, not tabulated per
-# opcode. measured on gfx1102 over every SALU opcode the device implements:
-#   transit  = 2, +2 if the instruction needs a register read that is not a plain operand (its own
-#              destination, or an M0 indexed source), +1 if it multiplies
-#   interval = 2 if it multiplies, or if it reads two sgpr sources that each fit in one register;
-#              otherwise 1
+# dispatch_to_exec is the cycles from an instruction being enqueued to its ALUEXEC packet, measured
+# with an empty queue and an idle worker. it is not one number: something ahead of the worker costs
+# two extra cycles the first time and nothing after that. measured on gfx1102 with s_add_i32.
+COLD_DISPATCH_TO_EXEC = 4
+WARM_DISPATCH_TO_EXEC = 2
+# dispatch_to_exec and initiation interval are composed from properties of the opcode, not tabulated
+# per opcode. measured on gfx1102 over every SALU opcode the device implements:
+#   dispatch_to_exec = 2, +2 if the instruction needs a register read that is not a plain operand
+#              (its own destination, or an M0 indexed source), +1 if it multiplies
+#   interval         = 2 if it multiplies, or if it reads two sgpr sources that each fit in one register;
+#                      otherwise 1
 # the s_pack family fixes what "fits in one register" means: its sources are 16 bit fields, but each
 # still costs a whole register read, and it measures 2 like the 32 bit two source opcodes.
 # the 64 bit siblings are the surprise: s_and_b64 sustains 1/cycle where s_and_b32 sustains 1 per 2,
 # and the same holds for or/xor/nand/nor/xnor/lshl/lshr/ashr/bfe/cmp/cselect. s_bfm_b64 identifies
 # the mechanism: 64 bit destination but 32 bit sources, and it reads 2 like the 32 bit ops. so the
 # cost is in the source reads, not the width of the result.
-# s_movk_i32 is the control for the +2 transit term: it writes sdst without reading it, and is the
-# only SOPK opcode at transit 2.
+# s_movk_i32 is the control for the +2 dispatch_to_exec term: it writes sdst without reading it, and is the
+# only SOPK opcode at dispatch_to_exec 2.
 # OPERANDS marks sdst the same whether it is read or written, so the extra-read set is listed.
 _EXTRA_READ = ("s_cmpk_", "s_addk_", "s_mulk_", "s_cmovk_", "s_cmov_", "s_bitset0_", "s_bitset1_", "s_movrels")
 
@@ -93,8 +94,8 @@ def _kernel(name:str, insts:list, register:bool=True):
   if register: KERNELS[name] = fxn
   return fxn
 
-# one SALU instruction, nothing before it. the queue is empty because the wave just started, so the
-# measured dispatch->exec gap is the queue transit floor -- plus any wave launch cost baked in.
+# one SALU instruction, nothing before it. the queue is empty because the wave just started, so this
+# is the cold dispatch_to_exec.
 custom_salu_single = _kernel("custom_salu_single", [
   s_add_i32(s[10], s[10], 1),
   s_endpgm(),
@@ -102,7 +103,7 @@ custom_salu_single = _kernel("custom_salu_single", [
 
 # the same measurement made a second time mid-kernel. s_nop occupies no pipe (it is an IMMEDIATE
 # packet with no exec), so by the time the second s_add is dispatched the SALU queue has long
-# drained. if this one also shows QUEUE_CYCLES then the gap is queue transit, not wave launch.
+# drained. the second one costs two cycles less, so the extra is not queue occupancy.
 custom_salu_after_idle = _kernel("custom_salu_after_idle", [
   s_add_i32(s[10], s[10], 1),
   *[s_nop(0) for _ in range(8)],
@@ -113,7 +114,7 @@ custom_salu_after_idle = _kernel("custom_salu_after_idle", [
 # ── SALU sweep ───────────────────────────────────────────────────────────────────────────────────
 # One kernel per instruction, holding nothing but that instruction SWEEP_REPEATS times, each writing
 # a different destination so the repeats are independent. The wave starts with an empty queue, so the
-# first one measures transit; the spacing between their execs measures how fast the worker takes new
+# first one measures dispatch_to_exec; the spacing between their execs measures how fast the worker takes new
 # work. No drain is needed: the kernel is the block.
 # a wave prefetches at most 3 instruction cache lines (3*64 bytes) ahead of the pc plus the line it
 # is on, so 256 bytes = 64 instructions of straight line code run before it catches the prefetcher
@@ -191,35 +192,34 @@ class TestSIMDModel(unittest.TestCase):
   def _salu_gaps(self, fxn, kname):
     return [(t, e) for t, e, _, op in self._capture(fxn, kname) if op.startswith("S_ADD")]
 
-  # refuted by: a gap that is not FIRST_INST_CYCLES
-  def test_first_instruction_transit(self):
+  # refuted by: a gap that is not COLD_DISPATCH_TO_EXEC
+  def test_cold_dispatch_to_exec(self):
     gaps = self._salu_gaps(custom_salu_single, "custom_salu_single")
     self.assertEqual(len(gaps), 1)
     t, e = gaps[0]
-    self.assertIsNotNone(e, "no ALUEXEC packet, cannot measure queue transit")
-    self.assertEqual(e - t, FIRST_INST_CYCLES)
+    self.assertIsNotNone(e, "no ALUEXEC packet, nothing to measure")
+    self.assertEqual(e - t, COLD_DISPATCH_TO_EXEC)
 
-  # the second s_add is dispatched long after the SALU queue drained, so it measures transit without
-  # whatever the first instruction of a wave pays for.
-  # refuted by: the second gap equalling the first (transit would then be one constant), or the two
-  # gaps differing from these values at all
-  def test_steady_state_transit(self):
+  # the second s_add is dispatched long after the SALU queue drained, so its dispatch_to_exec has no
+  # queue occupancy in it. it still reads two cycles less than the first.
+  # refuted by: the second gap equalling the first, or either gap differing from these values
+  def test_warm_dispatch_to_exec(self):
     gaps = self._salu_gaps(custom_salu_after_idle, "custom_salu_after_idle")
     self.assertEqual(len(gaps), 2)
     for i, (t, e) in enumerate(gaps):
       self.assertIsNotNone(e, f"s_add {i} has no ALUEXEC packet")
-    self.assertEqual(gaps[0][1] - gaps[0][0], FIRST_INST_CYCLES, "first s_add")
-    self.assertEqual(gaps[1][1] - gaps[1][0], QUEUE_CYCLES, "second s_add, queue already drained")
+    self.assertEqual(gaps[0][1] - gaps[0][0], COLD_DISPATCH_TO_EXEC, "first s_add")
+    self.assertEqual(gaps[1][1] - gaps[1][0], WARM_DISPATCH_TO_EXEC, "second s_add, queue drained")
 
-  # every SALU instruction should show the same transit on an idle queue and the same initiation
-  # interval back to back. exceptions are listed, and anything new is a discovery.
-  # refuted by: an opcode whose transit or interval is not what SALU_TIMING says
+  # every SALU instruction should show the same dispatch_to_exec on an idle queue and the same
+  # initiation interval back to back. anything new is a discovery.
+  # refuted by: an opcode whose dispatch_to_exec or interval is not what salu_timing() says
   def test_salu_sweep(self):
     fails = []
     for name in sweep_ops(Device["AMD"].arch):
       # one kernel holding one block, dispatched SWEEP_BLOCKS times, so every trial runs the same
       # code at the same offset. the block is short enough that the prefetcher never runs dry.
-      # every trial is kept. a handful of opcodes read transit 4 on trial 0 and 2 on the rest, and
+      # every trial is kept. a handful of opcodes read dispatch_to_exec 4 on trial 0 and 2 on the rest, and
       # which ones they are changes between runs, so the first dispatch is not reproducible the way
       # everything else here is. that is a finding, not noise to drop: do not add a warmup dispatch
       # to hide it.
@@ -236,18 +236,18 @@ class TestSIMDModel(unittest.TestCase):
       for b, proj in enumerate(projs):
         blk = [(t, e) for t, e, _, _op in proj]
         self.assertEqual(len(blk), SWEEP_REPEATS, f"{name} trial {b}: unexpected instruction count")
-        transit = None if blk[0][1] is None else blk[0][1] - blk[0][0]
+        d2e = None if blk[0][1] is None else blk[0][1] - blk[0][0]
         disp = [y[0]-x[0] for x, y in zip(blk, blk[1:])]
         gaps = [y[1]-x[1] for x, y in zip(blk, blk[1:]) if x[1] is not None and y[1] is not None]
         # the wrexec family runs its first few at the normal rate before settling, so read the
         # interval off the tail rather than off the ramp.
         tail = gaps[SWEEP_RAMP:]
         interval = max(set(tail), key=tail.count) if tail else None
-        seen.add((transit, interval))
-        # absolute cycles first, then the gaps between them. transit is the vertical distance
-        # between the two rows, so it is the first exec time once both are anchored on dispatch 0.
+        seen.add((d2e, interval))
+        # absolute cycles first, then the gaps between them. dispatch_to_exec is the vertical
+        # distance between the two rows, so it is the first exec time once both are anchored on 0.
         t0 = blk[0][0]
-        print(f"    #{b} transit={str(transit):>4} interval={str(interval):>4}")
+        print(f"    #{b} d2e={str(d2e):>4} interval={str(interval):>4}")
         print(f"        dispatch {[t - t0 for t, _ in blk]}")
         print(f"        exec     {[None if e is None else e - t0 for _, e in blk]}")
         print(f"        d gaps   {disp}")
