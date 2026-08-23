@@ -137,29 +137,22 @@ def llvm_filter_valid_asm(tests:list[tuple[str, bytes]], mcpu:str, mattr:str) ->
   # Invalid instructions produce 0 bytes; also filter where LLVM roundtrip doesn't match original
   return [(asm, data) for (asm, data), chunk in zip(tests, results) if len(chunk) > 0 and chunk == data]
 
-def capture(fxn:Callable, n_runs:int=1, simd_sel:int=0) -> tuple[list[list[bytes]], bytes, str]:
-  a = Tensor.empty(32, dtype=dtypes.float32).contiguous().realize()
-  runs, kern = [], 0
-  for _ in range(n_runs):
-    start = len(Compiled.profile_events)
-    with Context(SQTT_LIMIT_SE=1, SQTT_ITRACE_SE_MASK=1, SQTT_SIMD_SEL=simd_sel):
-      Tensor.custom_kernel(a, fxn=fxn)[0].realize()
-    Device[Device.DEFAULT].synchronize()
-    evs = [e for e in Compiled.profile_events[start:] if type(e).__name__ == "ProfileSQTTEvent" and e.itrace]
-    assert evs, "hardware produced no instruction-traced SQTT events, is SQTT=1 set?"
-    kern = evs[0].kern
-    runs.append([e.blob for e in evs])
-  prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
-  assert (prg:=prgs.get(kern)) is not None and prg.lib, f"no ProfileProgramEvent tagged {kern}, is PROFILE=1 set?"
-  return runs, prg.lib, Device["AMD"].arch
-
 def capture_runs(fxn:Callable, n_runs:int=1, max_dispatch:int=40):
-  sel, projs, lib, arch = None, [], None, None
+  a = Tensor.empty(32, dtype=dtypes.float32).contiguous().realize()
+  arch, sel, projs, lib = Device["AMD"].arch, None, [], None
   for _ in range(max_dispatch):
     if len(projs) == n_runs: break
     for simd_sel in (range(4) if sel is None else [sel]):
-      blobs, lib, arch = capture(fxn, 1, simd_sel)
-      if pr:=next((p for b in blobs[0] if (p:=sram_scope(b, lib, arch))), None):
+      start = len(Compiled.profile_events)
+      with Context(SQTT_LIMIT_SE=1, SQTT_ITRACE_SE_MASK=1, SQTT_SIMD_SEL=simd_sel):
+        Tensor.custom_kernel(a, fxn=fxn)[0].realize()
+      Device[Device.DEFAULT].synchronize()
+      evs = [e for e in Compiled.profile_events[start:] if type(e).__name__ == "ProfileSQTTEvent" and e.itrace]
+      assert evs, "hardware produced no instruction-traced SQTT events, is SQTT=1 set?"
+      prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
+      assert (prg:=prgs.get(evs[0].kern)) is not None and prg.lib, f"no ProfileProgramEvent tagged {evs[0].kern}, is PROFILE=1 set?"
+      lib = prg.lib
+      if pr:=next((p for e in evs if (p:=sram_scope(e.blob, lib, arch))), None):
         sel = simd_sel
         projs.append(pr)
         break
