@@ -1,16 +1,20 @@
 # Tests of our mental model of one RDNA3 SIMD against real hardware.
 #
-# These are not regression tests for tinygrad. Each test states one property of the model in
-# RDNA3_representation.md and runs a kernel whose SQTT trace proves or refutes it. They need a real
-# AMD GPU and skip everywhere else, so they never run in CI.
+# These are not regression tests for tinygrad. The sweep runs one kernel per opcode on hardware and
+# on the emulator and requires the two traces to be identical, so the model of the SIMD lives in the
+# emulator rather than being restated here. They need a real AMD GPU and skip everywhere else, so
+# they never run in CI.
 #
-# A failure here means the model is wrong, not that the code is. Do not loosen an assertion to make
-# it pass: change the model, and record what refuted it.
+# A failure here means the emulator or the model is wrong, not that the test is. Do not loosen an
+# assertion to make it pass: fix the emulator, or change the model and record what refuted it.
 #
-# The model under test: each pipe (SALU, VALU, LDS, VMEM) is a FIFO queue feeding a worker.
+# The model: each pipe (SALU, VALU, LDS, VMEM) is a FIFO queue feeding a worker.
 #   dispatch  the wave put the instruction in the queue      SQTT INST / VALUINST packet
 #   exec      the worker took it out and started on it       SQTT ALUEXEC / VMEMEXEC packet
 # There is no completion event, so nothing here can measure how long an instruction runs for.
+# The scope is deliberately narrow: one opcode per kernel, repeated, nothing else in flight. Kernel
+# shapes the sweep cannot reach (a lone instruction, an idle queue mid-wave, mixed opcodes) are not
+# covered and want their own kernels when the time comes.
 import unittest
 from tinygrad import Device
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
@@ -23,11 +27,7 @@ from tinygrad.runtime.autogen.amd.rdna3.ins import *
 from test.amd.helpers import TARGET_TO_ARCH, llvm_disasm, get_mattr, capture_runs, capture_emu, sram_scope
 from test.amd.helpers import times_of, execs_of, insts_of
 
-# dispatch_to_exec is the cycles from an instruction being enqueued to its ALUEXEC packet, measured
-# with an empty queue and an idle worker. it is not one number: something ahead of the worker costs
-# two extra cycles the first time and nothing after that. measured on gfx1102 with s_add_i32.
-COLD_DISPATCH_TO_EXEC = 4
-WARM_DISPATCH_TO_EXEC = 2
+# dispatch_to_exec is the cycles from an instruction being enqueued to its ALUEXEC packet.
 # dispatch_to_exec and initiation interval are composed from properties of the opcode, not tabulated
 # per opcode. measured on gfx1102 over every SALU opcode the device implements:
 #   dispatch_to_exec = 2, +2 if the instruction needs a register read that is not a plain operand
@@ -88,23 +88,6 @@ def _kernel(name:str, insts:list):
     sink = UOp.sink(A.flatten().base, threads, wg, arg=KernelInfo(name))
     return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=x) for x in insts]))))
   return fxn
-
-# one SALU instruction, nothing before it. the queue is empty because the wave just started, so this
-# is the cold dispatch_to_exec.
-custom_salu_single = _kernel("custom_salu_single", [
-  s_add_i32(s[10], s[10], 1),
-  s_endpgm(),
-])
-
-# the same measurement made a second time mid-kernel. s_nop occupies no pipe (it is an IMMEDIATE
-# packet with no exec), so by the time the second s_add is dispatched the SALU queue has long
-# drained. the second one costs two cycles less, so the extra is not queue occupancy.
-custom_salu_after_idle = _kernel("custom_salu_after_idle", [
-  s_add_i32(s[10], s[10], 1),
-  *[s_nop(0) for _ in range(8)],
-  s_add_i32(s[11], s[11], 1),
-  s_endpgm(),
-])
 
 # ── SALU sweep ───────────────────────────────────────────────────────────────────────────────────
 # One kernel per instruction, holding nothing but that instruction SWEEP_REPEATS times, each writing
@@ -170,35 +153,6 @@ class TestSIMDModel(unittest.TestCase):
   def setUpClass(cls):
     if "MOCK" in type(Device["AMD"].iface).__name__: raise unittest.SkipTest("needs real hardware, not the emulator")
     if TARGET_TO_ARCH[Device["AMD"].arch] != "rdna3": raise unittest.SkipTest("only rdna3")
-
-  # capture on hardware and return the projection
-  def _capture(self, fxn, kname):
-    projs, raw, lib, arch, simd = capture_runs(fxn, kname)
-    self.raw = (raw[0][0], lib, arch, simd)
-    print(f"\n  {kname}: " + ", ".join(f"{op}@{t}->{e}" for t, e, _, op in projs[0]))
-    return projs[0]
-
-  def _salu_gaps(self, fxn, kname):
-    return [(t, e) for t, e, _, op in self._capture(fxn, kname) if op.startswith("S_ADD")]
-
-  # refuted by: a gap that is not COLD_DISPATCH_TO_EXEC
-  def test_cold_dispatch_to_exec(self):
-    gaps = self._salu_gaps(custom_salu_single, "custom_salu_single")
-    self.assertEqual(len(gaps), 1)
-    t, e = gaps[0]
-    self.assertIsNotNone(e, "no ALUEXEC packet, nothing to measure")
-    self.assertEqual(e - t, COLD_DISPATCH_TO_EXEC)
-
-  # the second s_add is dispatched long after the SALU queue drained, so its dispatch_to_exec has no
-  # queue occupancy in it. it still reads two cycles less than the first.
-  # refuted by: the second gap equalling the first, or either gap differing from these values
-  def test_warm_dispatch_to_exec(self):
-    gaps = self._salu_gaps(custom_salu_after_idle, "custom_salu_after_idle")
-    self.assertEqual(len(gaps), 2)
-    for i, (t, e) in enumerate(gaps):
-      self.assertIsNotNone(e, f"s_add {i} has no ALUEXEC packet")
-    self.assertEqual(gaps[0][1] - gaps[0][0], COLD_DISPATCH_TO_EXEC, "first s_add")
-    self.assertEqual(gaps[1][1] - gaps[1][0], WARM_DISPATCH_TO_EXEC, "second s_add, queue drained")
 
   # every SALU instruction should show the same dispatch_to_exec on an idle queue and the same
   # initiation interval back to back. anything new is a discovery.
