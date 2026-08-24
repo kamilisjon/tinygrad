@@ -169,6 +169,10 @@ _pcode_fixes = {
   'S_MAX_U32': ('SCC = S0.u32 >= S1.u32', 'SCC = S0.u32 > S1.u32'),
   # hardware computes abs on the WRAPPED 32-bit difference; the i32 pcode overflows into UB on the host (e.g. |45 - -2147483647|),
   # so compute in u32 with a UB-free two's-complement negate
+  # a 32 iteration loop of single bit writes unrolls to 64 stores to D0, which memory_coalescing
+  # rejects. the closed form spreads each source bit into two adjacent destination bits.
+  'S_BITREPLICATE_B64_B32': ('tmp = S0.u32;\nfor i in 0 : 31 do\nD0.u64[i * 2] = tmp[i];\nD0.u64[i * 2 + 1] = tmp[i]\nendfor',
+                             'D0.u64 = bitreplicate(S0.u32)'),
   'S_ABSDIFF_I32': ('D0.i32 = S0.i32 - S1.i32;\nif D0.i32 < 0 then\nD0.i32 = -D0.i32\nendif',
                     'D0.u32 = S0.u32 - S1.u32;\nif D0.i32 < 0 then\nD0.u32 = -D0.u32\nendif'),
   # CLASS denormal test uses abs(x) > 0.0, which the host's DAZ flushes; use bit-domain test instead

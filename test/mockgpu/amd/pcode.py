@@ -54,6 +54,13 @@ def _bitreverse(v: UOp, bits: int) -> UOp:
   for m, s in masks: v = ((v >> _const(dt, s)) & _const(dt, m)) | ((v & _const(dt, m)) << _const(dt, s))
   return (v >> _const(dt, 32 if bits == 64 else 16)) | (v << _const(dt, 32 if bits == 64 else 16))
 
+def _bitreplicate(v: UOp) -> UOp:
+  x = v.cast(dtypes.uint64) & _const(dtypes.uint64, 0xFFFFFFFF)
+  for s, m in ((16, 0x0000FFFF0000FFFF), (8, 0x00FF00FF00FF00FF), (4, 0x0F0F0F0F0F0F0F0F),
+               (2, 0x3333333333333333), (1, 0x5555555555555555)):
+    x = (x | (x << _const(dtypes.uint64, s))) & _const(dtypes.uint64, m)
+  return x | (x << _const(dtypes.uint64, 1))
+
 def _extract_bits(val: UOp, hi: int, lo: int) -> UOp:
   dt = dtypes.uint64 if val.dtype in (dtypes.uint64, dtypes.int64) else dtypes.uint32
   width = hi - lo + 1
@@ -352,7 +359,7 @@ _FUNCS: dict[str, Callable[..., UOp]] = {
   'sqrt': lambda a: UOp(Ops.SQRT, src=(a,)), 'trunc': lambda a: UOp(Ops.TRUNC, src=(a,)),
   'log2': lambda a: UOp(Ops.LOG2, src=(a,)), 'sin': lambda a: _trig_reduce(a),
   'cos': lambda a: _trig_reduce(a, 0.25), 'floor': _floor, 'fract': lambda a: a - _floor(a),
-  'signext': _signext, 'abs': _abs,
+  'signext': _signext, 'abs': _abs, 'bitreplicate': _bitreplicate,
   'isEven': lambda a: (UOp(Ops.TRUNC, src=(a,)).cast(dtypes.int) & _const(dtypes.int, 1)).eq(_const(dtypes.int, 0)),
   'max': lambda a, b: UOp(Ops.MAX, src=(a, b)),
   'min': lambda a, b: UOp(Ops.MAX, src=(a.neg(), b.neg())).neg(),

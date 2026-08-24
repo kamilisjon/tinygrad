@@ -1076,5 +1076,19 @@ class TestMovrel(unittest.TestCase):
     self.assertEqual(st.sgpr[7], 0xCC)
 
 
+class TestBitreplicate(unittest.TestCase):
+  """S_BITREPLICATE_B64_B32 spreads each source bit into two adjacent destination bits."""
+
+  def _ref(self, s0: int) -> int:
+    return sum(((s0 >> i) & 1) * (0b11 << (2 * i)) for i in range(32))
+
+  def test_s_bitreplicate(self):
+    for v in (0, 1, 0xFFFFFFFF, 0xAAAAAAAA, 0x55555555, 0x12345678, 0x80000000):
+      instructions = [s_mov_b32(s[4], v), s_bitreplicate_b64_b32(s[6:7], s[4])]
+      st = run_program(instructions, n_lanes=1)
+      got, want = st.sgpr[6] | (st.sgpr[7] << 32), self._ref(v)
+      self.assertEqual(got, want, f"s0={v:#010x} got {got:#018x} want {want:#018x}")
+
+
 if __name__ == '__main__':
   unittest.main()
