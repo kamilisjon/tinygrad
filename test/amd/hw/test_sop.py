@@ -1036,5 +1036,45 @@ class TestAbsdiffOverflowRegressions(unittest.TestCase):
     self.assertEqual(st.scc, 0)
 
 
+class TestMovrel(unittest.TestCase):
+  """M0 indexed scalar register moves."""
+
+  def test_s_movrels_b32(self):
+    # reads SGPR[ssrc0 + M0], so s[4] with M0=2 reads s[6]
+    instructions = [s_mov_b32(M0, 2), s_mov_b32(s[6], 0xAA), s_movrels_b32(s[3], s[4])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.sgpr[3], 0xAA)
+
+  def test_s_movrels_b32_m0_zero(self):
+    instructions = [s_mov_b32(M0, 0), s_mov_b32(s[4], 0x1234), s_movrels_b32(s[3], s[4])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.sgpr[3], 0x1234)
+
+  def test_s_movreld_b32(self):
+    # writes SGPR[sdst + M0], so s[5] with M0=3 writes s[8]
+    instructions = [s_mov_b32(M0, 3), s_mov_b32(s[4], 0xBB), s_movreld_b32(s[5], s[4])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.sgpr[8], 0xBB)
+    self.assertEqual(st.sgpr[5], 0)
+
+  def test_s_movrels_b64(self):
+    instructions = [s_mov_b32(M0, 2), s_mov_b32(s[6], 0x11), s_mov_b32(s[7], 0x22), s_movrels_b64(s[2:3], s[4:5])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.sgpr[2], 0x11)
+    self.assertEqual(st.sgpr[3], 0x22)
+
+  def test_s_movreld_b64(self):
+    instructions = [s_mov_b32(M0, 2), s_mov_b32(s[8], 0x33), s_mov_b32(s[9], 0x44), s_movreld_b64(s[4:5], s[8:9])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.sgpr[6], 0x33)
+    self.assertEqual(st.sgpr[7], 0x44)
+
+  def test_s_movrelsd_2_b32(self):
+    # source offset is M0[9:0], destination offset is M0[25:16]
+    instructions = [s_mov_b32(M0, (4 << 16) | 2), s_mov_b32(s[6], 0xCC), s_movrelsd_2_b32(s[3], s[4])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.sgpr[7], 0xCC)
+
+
 if __name__ == '__main__':
   unittest.main()

@@ -66,7 +66,7 @@ from tinygrad.runtime.autogen.amd.cdna.str_pcode import PCODE as PCODE_CDNA
 from tinygrad.runtime.autogen.amd.rdna3 import ins as ir3
 from tinygrad.runtime.autogen.amd.rdna4 import ins as ir4
 from tinygrad.runtime.autogen.amd.cdna import ins as irc
-from tinygrad.renderer.amd.dsl import VCC_LO, EXEC_LO, SCC, ttmp, Inst
+from tinygrad.renderer.amd.dsl import VCC_LO, EXEC_LO, SCC, M0, ttmp, Inst
 from tinygrad.runtime.autogen.amd.common import Fmt, OpType
 from test.amd.helpers import decode_dpp16
 from test.mockgpu.amd.pcode import parse_pcode, _FUNCS, _set_bits, _to_bool, _to_u32, _val_to_bits, _ftz_f32
@@ -746,6 +746,16 @@ def _compile_sop(inst: ir3.SOP1|ir3.SOP2|ir3.SOPC|ir3.SOPK|ir4.SOP1|ir4.SOP2|ir4
     if isinstance(inst, ir4.SOP1) and inst.op in _BARRIER_SOP1_OPS: return UOp.sink(*ctx.inc_pc())
     sdst_off = ctx.inst_field(type(inst).sdst)
     ssrc0_off = ctx.inst_field(type(inst).ssrc0)
+    # the movrel family indexes the sgpr file by M0 plus the raw register number from the encoding.
+    # pcode calls those SRC0/DST and reads SGPR[addr], neither of which the pcode env has, so they
+    # are compiled here instead.
+    if (nm:=getattr(inst.op, 'name', '')).startswith(('S_MOVRELS', 'S_MOVRELD')):
+      m0 = ctx.rsgpr_dyn(_c(M0.offset))
+      if 'MOVRELSD_2' in nm:  # separate 10 bit source and destination offsets packed into M0
+        rd, wr = ssrc0_off + (m0 & _c(0x3FF)), sdst_off + ((m0 >> _c(16)) & _c(0x3FF))
+      elif 'MOVRELS' in nm: rd, wr = ssrc0_off + m0, sdst_off
+      else: rd, wr = ssrc0_off, sdst_off + m0
+      return UOp.sink(*[ctx.wsgpr_dyn(wr + _c(i), ctx.rsgpr_dyn(rd + _c(i))) for i in range(bits['d'] // 32)], *ctx.inc_pc())
     srcs = {'S0': ctx.rsrc_dyn(ssrc0_off, None, bits['s0'], literal)}
     dst_off, dst_size = sdst_off, bits['d'] // 32
   elif isinstance(inst, (ir3.SOP2, ir4.SOP2, irc.SOP2)):
