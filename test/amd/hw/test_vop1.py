@@ -1729,5 +1729,49 @@ class TestFrexpMantF16(unittest.TestCase):
     self.assertEqual(st.vgpr[0][1] & 0xFFFF, 0x7C00)
 
 
+class TestVectorMovrel(unittest.TestCase):
+  def _setup(self, pairs):
+    out = [s_mov_b32(M0, 0)]
+    for reg, val in pairs: out += [s_mov_b32(s[0], val), v_mov_b32_e32(v[reg], s[0])]
+    return out
+
+  def test_v_movrels_b32(self):
+    instructions = self._setup([(3, 0xAA)]) + [s_mov_b32(M0, 2), v_movrels_b32_e32(v[0], v[1])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.vgpr[0][0], 0xAA)
+
+  def test_v_movrels_b32_m0_zero(self):
+    instructions = self._setup([(1, 0x1234)]) + [s_mov_b32(M0, 0), v_movrels_b32_e32(v[0], v[1])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.vgpr[0][0], 0x1234)
+
+  def test_v_movreld_b32(self):
+    instructions = self._setup([(1, 0xBB)]) + [s_mov_b32(M0, 3), v_movreld_b32_e32(v[2], v[1])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.vgpr[0][5], 0xBB)
+    self.assertEqual(st.vgpr[0][2], 0)
+
+  def test_v_movrelsd_b32(self):
+    instructions = self._setup([(3, 0xCC)]) + [s_mov_b32(M0, 2), v_movrelsd_b32_e32(v[6], v[1])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.vgpr[0][8], 0xCC)
+
+  def test_v_movrelsd_2_b32(self):
+    instructions = self._setup([(3, 0xDD)]) + [s_mov_b32(M0, (4 << 16) | 2), v_movrelsd_2_b32_e32(v[6], v[1])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.vgpr[0][10], 0xDD)
+
+  def test_v_swaprel_b32(self):
+    instructions = self._setup([(3, 0x11), (10, 0x22)]) + [s_mov_b32(M0, (4 << 16) | 2), v_swaprel_b32_e32(v[6], v[1])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.vgpr[0][10], 0x11)
+    self.assertEqual(st.vgpr[0][3], 0x22)
+
+  def test_v_movrels_b32_all_lanes(self):
+    instructions = self._setup([(3, 0x77)]) + [s_mov_b32(M0, 2), v_movrels_b32_e32(v[0], v[1])]
+    st = run_program(instructions, n_lanes=4)
+    for lane in range(4): self.assertEqual(st.vgpr[lane][0], 0x77)
+
+
 if __name__ == '__main__':
   unittest.main()

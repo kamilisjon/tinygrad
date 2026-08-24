@@ -955,6 +955,7 @@ def _compile_vop12(inst: ir3.VOP1 | ir3.VOP1_SDST | ir3.VOP1_DPP16 | ir3.VOP2 | 
                    irc.VOP1 | irc.VOP1_DPP16 | irc.VOP2 | irc.VOP2_DPP16, ctx: _Ctx) -> UOp:
   op_name = _op_name(inst)
   if op_name in ('V_READFIRSTLANE_B32_E32', 'V_PERMLANE64_B32_E32'): return ctx.compile_lane_pcode(inst.op, inst)
+  if op_name.replace('_E32', '') in _MOVREL_OPS: return _compile_movrel(inst, ctx)
   # v_accvgpr_mov_b32: ACCVGPR[vdst] = ACCVGPR[src0] (VOP1 encoding, no pcode)
   if 'ACCVGPR_MOV' in op_name:
     lane, exec_mask = ctx.range(), ctx.rexec()
@@ -993,6 +994,24 @@ def _compile_vop12(inst: ir3.VOP1 | ir3.VOP1_SDST | ir3.VOP1_DPP16 | ir3.VOP2 | 
       assert literal is not None
       srcs['SIMM32'] = literal
   return ctx.compile_vop_pcode(inst.op, srcs, lane, vdst_reg, exec_mask, opsel_dst_hi=write_hi_half, src0_off=src0_off)
+
+_MOVREL_OPS = ('V_MOVRELS_B32', 'V_MOVRELD_B32', 'V_MOVRELSD_B32', 'V_MOVRELSD_2_B32', 'V_SWAPREL_B32')
+
+def _compile_movrel(inst, ctx: _Ctx) -> UOp:
+  name = _op_name(inst).replace('_E32', '').replace('_E64', '')
+  lane, exec_mask = ctx.range(), ctx.rexec()
+  m0 = ctx.rsgpr_dyn(_c(M0.offset))
+  src0, dst = ctx.inst_field(type(inst).src0) - _c(256), ctx.inst_field(type(inst).vdst)
+  # movrelsd_2 and swaprel pack a separate 10 bit source and destination offset into M0
+  off_s, off_d = (m0 & _c(0x3FF), (m0 >> _c(16)) & _c(0x3FF)) if name in ('V_MOVRELSD_2_B32', 'V_SWAPREL_B32') else (m0, m0)
+  addrs, addrd = src0 + off_s, dst + off_d
+  if name == 'V_MOVRELS_B32': stores = [ctx.wvgpr_dyn(dst, lane, ctx.rvgpr_dyn(addrs, lane), exec_mask)]
+  elif name == 'V_MOVRELD_B32': stores = [ctx.wvgpr_dyn(addrd, lane, ctx.rvgpr_dyn(src0, lane), exec_mask)]
+  elif name == 'V_SWAPREL_B32':
+    s_val, d_val = ctx.rvgpr_dyn(addrs, lane), ctx.rvgpr_dyn(addrd, lane)
+    stores = [ctx.wvgpr_dyn(addrd, lane, s_val, exec_mask), ctx.wvgpr_dyn(addrs, lane, d_val, exec_mask)]
+  else: stores = [ctx.wvgpr_dyn(addrd, lane, ctx.rvgpr_dyn(addrs, lane), exec_mask)]
+  return UOp.sink(UOp.sink(*stores).end(lane), *ctx.inc_pc())
 
 def _compile_vopc(inst: ir3.VOPC|ir3.VOPC_DPP16|ir3.VOP3|ir4.VOPC|ir4.VOPC_DPP16|ir4.VOP3|irc.VOPC|irc.VOP3, ctx: _Ctx,
                   opsel: int = 0, abs_bits: int = 0, neg_bits: int = 0) -> UOp:
@@ -1083,6 +1102,8 @@ def _compile_vop3(inst: ir3.VOP3 | ir4.VOP3 | irc.VOP3, ctx: _Ctx) -> UOp:
   # V_PERMLANE16_B32 / V_PERMLANEX16_B32: cross-lane swizzle via pcode
   if 'PERMLANE16' in op_name or 'PERMLANEX16' in op_name:
     return ctx.compile_lane_pcode(inst.op, inst)
+
+  if op_name.replace('_E64', '') in _MOVREL_OPS: return _compile_movrel(inst, ctx)
 
    # VOP3 VOPC (v_cmp_*_e64) - delegate to unified VOPC handler
   if 'V_CMP' in op_name or 'V_CMPX' in op_name:
