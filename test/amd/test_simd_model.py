@@ -7,7 +7,7 @@ import tinygrad.runtime.autogen.amd.rdna3.ins as r3
 import tinygrad.runtime.autogen.amd.rdna3.enum as e3
 from tinygrad.renderer.amd import decode_inst
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
-from test.amd.helpers import TARGET_TO_ARCH, capture_runs, sram_scope
+from test.amd.helpers import TARGET_TO_ARCH, SIMDS, capture_runs, sram_scope
 import ctypes, test.mockgpu.amd.emu as emu
 
 assert "MOCK" not in type(Device["AMD"].iface).__name__, "needs real hardware, the emulator is under test"
@@ -24,7 +24,7 @@ def _kernel(name:str, insts:list):
     return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=x) for x in insts]))))
   return fxn
 
-SWEEP_REPEATS, SWEEP_BLOCKS = 36, 2
+SWEEP_REPEATS = 36
 assert SWEEP_REPEATS + 1 <= 64, "kernel would outrun the prefetcher"
 _SWEEP_SRC, _SWEEP_DST = 4, 8
 assert _SWEEP_DST + 2*SWEEP_REPEATS <= 104, f"SWEEP_REPEATS={SWEEP_REPEATS} needs more sgprs than exist" 
@@ -59,7 +59,7 @@ class TestSIMDModel(unittest.TestCase):
       name = op.name.lower()
       kname = f"custom_salu_{name}"
       block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
-      projs, lib, arch = capture_runs(_kernel(kname, block), SWEEP_BLOCKS)
+      projs, lib, arch = capture_runs(_kernel(kname, block))
       code = b"".join(i.to_bytes() for i in block)
       buf, args = (ctypes.c_char * len(code)).from_buffer_copy(code), (ctypes.c_uint64 * 1)(0)
       emu.sqtt_traces.clear()
@@ -67,7 +67,7 @@ class TestSIMDModel(unittest.TestCase):
       assert emu.sqtt_traces, "emulator produced no SQTT trace, is PROFILE=1 set?"
       emu_proj = sram_scope(emu.sqtt_traces[0], lib, arch)
       was = len(fails)
-      if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: hardware trials disagree with each other")
+      if any(p != projs[0] for p in projs[1:]): fails.append(f"{name}: the two simds disagree with each other")
       if emu_proj != projs[0]:
         what = "instructions" if [r[2:] for r in emu_proj] != [r[2:] for r in projs[0]] else "timing"
         fails.append(f"{name}: emulator {what} differs from hardware")
@@ -83,7 +83,7 @@ class TestSIMDModel(unittest.TestCase):
                 "dispatch_to_exec": [None if e is None else e - t for t, e in blk],
                 "dispatch gaps": disp, "exec gaps": gaps}
         if b == 0: ref_rows = rows
-        print("    " + (colored("emu", "green" if ok else "red") if is_emu else f"#{b}"))
+        print("    " + (colored("emu", "green" if ok else "red") if is_emu else f"simd{SIMDS[b]}"))
         for k, v in rows.items(): print(f"        {k:<16} " + (_diff_row(v, ref_rows[k]) if is_emu else str(v)))
     self.assertFalse(fails, f"{len(fails)} opcodes disagree with the emulator or with themselves:\n" + "\n".join(fails))
 

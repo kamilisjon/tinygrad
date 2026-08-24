@@ -137,15 +137,16 @@ def llvm_filter_valid_asm(tests:list[tuple[str, bytes]], mcpu:str, mattr:str) ->
   # Invalid instructions produce 0 bytes; also filter where LLVM roundtrip doesn't match original
   return [(asm, data) for (asm, data), chunk in zip(tests, results) if len(chunk) > 0 and chunk == data]
 
-_phase = 0  # waves alternate between simd 0 and simd 2 on every dispatch, so the traced simd does too
+SIMDS = (0, 2)  # the traced cu's two simds, which waves alternate between on every dispatch
+_phase = 0
 
-def capture_runs(fxn:Callable, n_runs:int=1):
+def capture_runs(fxn:Callable):
   global _phase
   a = Tensor.empty(32, dtype=dtypes.float32).contiguous().realize()
-  arch, projs, lib = Device["AMD"].arch, [], None
-  for _ in range(n_runs + 2):
-    if len(projs) == n_runs: break
-    simd, _phase = (0, 2)[_phase], 1 - _phase
+  arch, projs, lib = Device["AMD"].arch, {}, None
+  for _ in range(2 * len(SIMDS)):
+    if len(projs) == len(SIMDS): break
+    simd, _phase = SIMDS[_phase], 1 - _phase
     st = len(Compiled.profile_events)
     with Context(SQTT_LIMIT_SE=1, SQTT_ITRACE_SE_MASK=1, SQTT_SIMD_SEL=simd):
       Tensor.custom_kernel(a, fxn=fxn)[0].realize()
@@ -156,10 +157,10 @@ def capture_runs(fxn:Callable, n_runs:int=1):
       prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
       assert (prg:=prgs.get(evs[0].kern)) is not None and prg.lib, f"no ProfileProgramEvent tagged {evs[0].kern}, is PROFILE=1 set?"
       lib = prg.lib
-    if pr:=sram_scope(evs[0].blob, lib, arch, simd): projs.append(pr)
-    else: _phase = 1 - _phase  # out of phase, resync
-  assert len(projs) == n_runs, f"only {len(projs)}/{n_runs} dispatches landed on the traced simd"
-  return projs, lib, arch
+    if pr:=sram_scope(evs[0].blob, lib, arch, simd): projs[simd] = pr
+    else: _phase = 1 - _phase  # out of phase, resync onto the same simd
+  assert len(projs) == len(SIMDS), f"only landed on simds {sorted(projs)}, wanted {list(SIMDS)}"
+  return [projs[s] for s in SIMDS], lib, arch
 
 def sram_scope(blob:bytes, lib:bytes, arch:str, simd:int=0) -> list[tuple[int, int|None, int, str]]:
   out: list[list] = []
