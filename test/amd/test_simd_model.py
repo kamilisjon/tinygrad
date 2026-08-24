@@ -2,16 +2,17 @@ import unittest
 from tinygrad import Device
 from tinygrad.helpers import colored, DEBUG
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
-from tinygrad.renderer.amd.dsl import s, OPERANDS
+from tinygrad.renderer.amd.dsl import s, v, M0, OPERANDS
 import tinygrad.runtime.autogen.amd.rdna3.ins as r3
 import tinygrad.runtime.autogen.amd.rdna3.enum as e3
 from tinygrad.renderer.amd import decode_inst
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
-from test.amd.helpers import TARGET_TO_ARCH, SIMDS, capture_runs, sram_scope
+from test.amd.helpers import TARGET_TO_ARCH, SIMDS, capture_runs, sram_scope, llvm_disasm, get_mattr
 import ctypes, test.mockgpu.amd.emu as emu
 
 assert "MOCK" not in type(Device["AMD"].iface).__name__, "needs real hardware, the emulator is under test"
 assert TARGET_TO_ARCH[Device["AMD"].arch] == "rdna3", "only rdna3"
+_MCPU, _MATTR = Device["AMD"].arch, get_mattr(TARGET_TO_ARCH[Device["AMD"].arch])
 
 # Each pipe (SALU, VALU, LDS, VMEM) is a FIFO queue feeding a worker.
 #   dispatch  the wave put the instruction in the queue
@@ -26,39 +27,51 @@ def _kernel(name:str, insts:list):
 
 SWEEP_REPEATS = 36
 assert SWEEP_REPEATS + 1 <= 64, "kernel would outrun the prefetcher"
-_SWEEP_SRC, _SWEEP_DST = 4, 8
-assert _SWEEP_DST + 2*SWEEP_REPEATS <= 104, f"SWEEP_REPEATS={SWEEP_REPEATS} needs more sgprs than exist" 
+_SWEEP_SRC, _SWEEP_DST, _VSWEEP_SRC, _VSWEEP_DST = 4, 8, 0, 4
+assert _SWEEP_DST + 2*SWEEP_REPEATS <= 104, f"SWEEP_REPEATS={SWEEP_REPEATS} needs more sgprs than exist"
+assert _VSWEEP_DST + 4*SWEEP_REPEATS <= 256, f"SWEEP_REPEATS={SWEEP_REPEATS} needs more vgprs than exist"
 
 _UNSAFE = ("PC", "SAVEEXEC", "SETREG", "GETREG", "BRANCH", "CALL", "RFE", "ENDPGM", "TRAP",
            "SENDMSG", "SLEEP", "BARRIER", "WAITCNT", "NOP", "HALT", "PRIO", "ICACHE", "TTRACE",
-           "WAKEUP", "PERFLEVEL", "VERSION", "CLAUSE", "DELAY", "WAIT", "MSG", "F16", "F32", "F64")
+           "WAKEUP", "PERFLEVEL", "VERSION", "CLAUSE", "DELAY", "WAIT", "MSG")
+_UNSAFE_SALU = _UNSAFE + ("F16", "F32", "F64")  # gfx1102 has no scalar float unit, these hang the queue
 
-def _sweep_inst(op, i:int):
-  kwargs, sreg = {}, _SWEEP_SRC
+def _regs(bank, base:int, width:int): return bank[base] if width <= 32 else bank[base:base+width//32-1]
+
+def _sweep_inst(op, i:int, vec:bool=False):
+  kwargs, sreg, vreg = {}, _SWEEP_SRC, _VSWEEP_SRC
   for field, (_fmt, width, kind) in OPERANDS[op].items():
+    name = "src0" if field == "vsrc0" else field
     if field == "simm16": kwargs[field] = 1
+    elif vec and kind.name == "OPR_SREG": kwargs[name] = s[_SWEEP_DST+2*i]  # vop3 encodes one index, the pair is implicit
     elif kind.name == "OPR_SDST":
       kwargs[field] = s[_SWEEP_DST+2*i:_SWEEP_DST+1+2*i] if width == 64 else s[_SWEEP_DST+i]
+    elif vec and field.endswith("dst"): kwargs[field] = _regs(v, _VSWEEP_DST+4*i, width)
+    elif vec:
+      kwargs[name] = _regs(v, vreg, width)
+      vreg += max(1, width//32)
     else:
-      kwargs[field] = s[sreg:sreg+1] if width == 64 else s[sreg]
-      sreg += 2 if width == 64 else 1
+      kwargs[field] = _regs(s, sreg, width)
+      sreg += max(1, width//32)
   return getattr(r3, op.name.lower())(**kwargs)
 
-def _sweep_ok(op) -> bool:
-  if OPERANDS.get(op) is None or any(u in op.name for u in _UNSAFE): return False
-  inst = _sweep_inst(op, 0)
-  return repr(decode_inst(inst.to_bytes(), "rdna3")) == repr(inst)
+def _sweep_ok(op, vec:bool=False) -> bool:
+  if (ops := OPERANDS.get(op)) is None or any(u in op.name for u in (_UNSAFE if vec else _UNSAFE_SALU)): return False
+  if any(kind.name == "OPR_EXEC" for _f, (_x, _w, kind) in ops.items()): return False
+  inst = _sweep_inst(op, 0, vec)
+  return repr(decode_inst(code:=inst.to_bytes(), "rdna3")) == repr(inst) and len(llvm_disasm(code, _MCPU, _MATTR)) == 1
 
 def _diff_row(vals:list, ref:list) -> str:
   return "[" + ", ".join(colored(str(v), "green" if i < len(ref) and ref[i] == v else "red") for i, v in enumerate(vals)) + "]"
 
 class TestSIMDModel(unittest.TestCase):
-  def _sweep(self, en):
+  def _sweep(self, en, vec:bool=False):
     fails = []
-    for op in sorted((m for m in en if _sweep_ok(m)), key=lambda m: m.name):
+    for op in sorted((m for m in en if _sweep_ok(m, vec)), key=lambda m: m.name):
       name = op.name.lower()
-      kname = f"custom_salu_{name}"
-      block = [_sweep_inst(op, i) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
+      kname = f"custom_{'valu' if vec else 'salu'}_{name}"
+      # m0 feeds the movrel index, leaving it uninitialised would index a vgpr outside the allocation
+      block = ([s_mov_b32(M0, 0)] if vec else []) + [_sweep_inst(op, i, vec) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
       projs, lib, arch = capture_runs(_kernel(kname, block))
       code = b"".join(i.to_bytes() for i in block)
       buf, args = (ctypes.c_char * len(code)).from_buffer_copy(code), (ctypes.c_uint64 * 1)(0)
@@ -91,6 +104,11 @@ class TestSIMDModel(unittest.TestCase):
   def test_sop2(self): self._sweep(e3.SOP2Op)
   def test_sopc(self): self._sweep(e3.SOPCOp)
   def test_sopk(self): self._sweep(e3.SOPKOp)
+
+  # vopc is swept through its vop3 encoding, the e32 form writes vcc implicitly and so serialises on itself
+  def test_vop1(self): self._sweep(e3.VOP1Op, vec=True)
+  def test_vop2(self): self._sweep(e3.VOP2Op, vec=True)
+  def test_vop3(self): self._sweep(e3.VOP3Op, vec=True)
 
 if __name__ == "__main__":
   unittest.main()
