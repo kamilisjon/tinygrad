@@ -25,8 +25,8 @@ def _kernel(name:str, insts:list):
     return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=x) for x in insts]))))
   return fxn
 
-SWEEP_REPEATS = 36
-assert SWEEP_REPEATS + 1 <= 64, "kernel would outrun the prefetcher"
+SWEEP_REPEATS = 30
+PREFETCH_BYTES = 256  # the prefetcher runs 3 cache lines ahead of the current one, past that the sweep stalls mid kernel
 _SWEEP_SRC, _SWEEP_DST, _VSWEEP_SRC, _VSWEEP_DST = 4, 8, 0, 4
 assert _SWEEP_DST + 2*SWEEP_REPEATS <= 104, f"SWEEP_REPEATS={SWEEP_REPEATS} needs more sgprs than exist"
 assert _VSWEEP_DST + 4*SWEEP_REPEATS <= 256, f"SWEEP_REPEATS={SWEEP_REPEATS} needs more vgprs than exist"
@@ -72,6 +72,7 @@ class TestSIMDModel(unittest.TestCase):
       kname = f"custom_{'valu' if vec else 'salu'}_{name}"
       # m0 feeds the movrel index, leaving it uninitialised would index a vgpr outside the allocation
       block = ([s_mov_b32(M0, 0)] if vec else []) + [_sweep_inst(op, i, vec) for i in range(SWEEP_REPEATS)] + [s_endpgm()]
+      assert (nb := sum(i.size() for i in block)) <= PREFETCH_BYTES, f"{name}: {nb} byte kernel outruns the prefetcher"
       projs, lib, arch = capture_runs(_kernel(kname, block))
       code = b"".join(i.to_bytes() for i in block)
       buf, args = (ctypes.c_char * len(code)).from_buffer_copy(code), (ctypes.c_uint64 * 1)(0)
