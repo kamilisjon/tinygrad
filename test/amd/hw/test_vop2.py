@@ -1037,5 +1037,37 @@ class TestCarryExecRegressions(unittest.TestCase):
     self.assertEqual(st.vgpr[31][2], 0)  # 0xFFFFFFFF + 1 wraps to 0 in active lanes
 
 
+class TestFmacDx9Zero(unittest.TestCase):
+  def test_v_fmac_dx9_zero_f32_keeps_accumulator(self):
+    instructions = [
+      s_mov_b32(s[0], f2i(0.0)), v_mov_b32_e32(v[0], s[0]),
+      s_mov_b32(s[1], f2i(float('inf'))), v_mov_b32_e32(v[1], s[1]),
+      s_mov_b32(s[2], f2i(7.0)), v_mov_b32_e32(v[2], s[2]),
+      v_fmac_dx9_zero_f32_e32(v[2], v[0], v[1]),
+    ]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(i2f(st.vgpr[0][2]), 7.0)
+
+  def test_v_fmac_dx9_zero_f32_src1_zero(self):
+    instructions = [
+      s_mov_b32(s[0], f2i(float('inf'))), v_mov_b32_e32(v[0], s[0]),
+      s_mov_b32(s[1], f2i(0.0)), v_mov_b32_e32(v[1], s[1]),
+      s_mov_b32(s[2], f2i(-3.5)), v_mov_b32_e32(v[2], s[2]),
+      v_fmac_dx9_zero_f32_e32(v[2], v[0], v[1]),
+    ]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(i2f(st.vgpr[0][2]), -3.5)
+
+  def test_v_fmac_dx9_zero_f32_normal(self):
+    instructions = [
+      s_mov_b32(s[0], f2i(2.0)), v_mov_b32_e32(v[0], s[0]),
+      s_mov_b32(s[1], f2i(3.0)), v_mov_b32_e32(v[1], s[1]),
+      s_mov_b32(s[2], f2i(4.0)), v_mov_b32_e32(v[2], s[2]),
+      v_fmac_dx9_zero_f32_e32(v[2], v[0], v[1]),
+    ]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(i2f(st.vgpr[0][2]), 10.0)
+
+
 if __name__ == '__main__':
   unittest.main()

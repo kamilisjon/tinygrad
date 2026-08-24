@@ -149,6 +149,7 @@ def _val_to_u32(val: UOp) -> UOp:
   return val.cast(dtypes.uint32)
 
 _pcode_fixes = {
+  'V_FMAC_DX9_ZERO_F32': ('D0.f32 = S2.f32', 'D0.f32 = D0.f32'),
   'V_DIV_FMAS_F32': ('D0.f32 = 2.0F ** 32 * fma(S0.f32, S1.f32, S2.f32)',
     'D0.f32 = (exponent(S2.f32) > 127) ? (2.0F ** 64 * fma(S0.f32, S1.f32, S2.f32)) : (2.0F ** -64 * fma(S0.f32, S1.f32, S2.f32))'),
   'V_DIV_FMAS_F64': ('D0.f64 = 2.0 ** 64 * fma(S0.f64, S1.f64, S2.f64)',

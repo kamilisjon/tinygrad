@@ -1690,5 +1690,44 @@ class TestCvtFrexpRegressions(unittest.TestCase):
       self.assertEqual(st.vgpr[0][2] & 0xFFFFFFFF, 0, f"f64 bits=0x{hi:08x}{lo:08x}")
 
 
+class TestExpF16(unittest.TestCase):
+  def test_v_exp_f16_positive(self):
+    instructions = [s_mov_b32(s[0], f32_to_f16(3.0)), v_mov_b32_e32(v[0], s[0]), v_exp_f16_e32(v[1], v[0])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(f16(st.vgpr[0][1] & 0xFFFF), 8.0)
+
+  def test_v_exp_f16_zero(self):
+    instructions = [s_mov_b32(s[0], f32_to_f16(0.0)), v_mov_b32_e32(v[0], s[0]), v_exp_f16_e32(v[1], v[0])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(f16(st.vgpr[0][1] & 0xFFFF), 1.0)
+
+  def test_v_exp_f16_negative(self):
+    instructions = [s_mov_b32(s[0], f32_to_f16(-2.0)), v_mov_b32_e32(v[0], s[0]), v_exp_f16_e32(v[1], v[0])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(f16(st.vgpr[0][1] & 0xFFFF), 0.25)
+
+
+class TestFrexpMantF16(unittest.TestCase):
+  def test_v_frexp_mant_f16(self):
+    instructions = [s_mov_b32(s[0], f32_to_f16(12.0)), v_mov_b32_e32(v[0], s[0]), v_frexp_mant_f16_e32(v[1], v[0])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(f16(st.vgpr[0][1] & 0xFFFF), 0.75)
+
+  def test_v_frexp_mant_f16_negative(self):
+    instructions = [s_mov_b32(s[0], f32_to_f16(-12.0)), v_mov_b32_e32(v[0], s[0]), v_frexp_mant_f16_e32(v[1], v[0])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(f16(st.vgpr[0][1] & 0xFFFF), -0.75)
+
+  def test_v_frexp_mant_f16_zero(self):
+    instructions = [s_mov_b32(s[0], f32_to_f16(0.0)), v_mov_b32_e32(v[0], s[0]), v_frexp_mant_f16_e32(v[1], v[0])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(f16(st.vgpr[0][1] & 0xFFFF), 0.0)
+
+  def test_v_frexp_mant_f16_inf(self):
+    instructions = [s_mov_b32(s[0], 0x7C00), v_mov_b32_e32(v[0], s[0]), v_frexp_mant_f16_e32(v[1], v[0])]
+    st = run_program(instructions, n_lanes=1)
+    self.assertEqual(st.vgpr[0][1] & 0xFFFF, 0x7C00)
+
+
 if __name__ == '__main__':
   unittest.main()

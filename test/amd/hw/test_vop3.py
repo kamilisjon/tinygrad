@@ -3742,5 +3742,34 @@ class TestMinMaxFlushE64Regressions(unittest.TestCase):
     self.assertEqual(st.vgpr[0][3], 0x3F800000)  # med(-0, 1, 2) = 1
 
 
+class TestDivFixupF16(unittest.TestCase):
+  def _run(self, s0: int, s1: int, s2: int) -> int:
+    instructions = [
+      s_mov_b32(s[0], s0), v_mov_b32_e32(v[0], s[0]),
+      s_mov_b32(s[1], s1), v_mov_b32_e32(v[1], s[1]),
+      s_mov_b32(s[2], s2), v_mov_b32_e32(v[2], s[2]),
+      v_div_fixup_f16(v[3], v[0], v[1], v[2]),
+    ]
+    return run_program(instructions, n_lanes=1).vgpr[0][3] & 0xFFFF
+
+  def test_zero_over_zero_is_nan(self):
+    self.assertEqual(self._run(f32_to_f16(1.0), f32_to_f16(0.0), f32_to_f16(0.0)), 0x7e00)
+
+  def test_inf_over_inf_is_nan(self):
+    self.assertEqual(self._run(f32_to_f16(1.0), 0x7C00, 0x7C00), 0x7e00)
+
+  def test_x_over_zero_is_inf(self):
+    self.assertEqual(self._run(f32_to_f16(1.0), f32_to_f16(0.0), f32_to_f16(4.0)), 0x7C00)
+
+  def test_x_over_negative_zero_is_negative_inf(self):
+    self.assertEqual(self._run(f32_to_f16(1.0), 0x8000, f32_to_f16(4.0)), 0xFC00)
+
+  def test_normal_takes_abs_of_src0(self):
+    self.assertEqual(f16(self._run(f32_to_f16(-3.0), f32_to_f16(2.0), f32_to_f16(6.0))), 3.0)
+
+  def test_normal_applies_sign_out(self):
+    self.assertEqual(f16(self._run(f32_to_f16(3.0), f32_to_f16(-2.0), f32_to_f16(6.0))), -3.0)
+
+
 if __name__ == '__main__':
   unittest.main()

@@ -29,7 +29,7 @@ def _to_u32(v): return v if v.dtype == dtypes.uint32 else v.bitcast(dtypes.uint3
 def _to_bool(v): return v if v.dtype == dtypes.bool else v.ne(_const(v.dtype, 0))
 def _cast_to(v, dt):
   if v.dtype == dt: return v
-  if dt == dtypes.half: return v.cast(dtypes.uint16).bitcast(dtypes.half)
+  if dt == dtypes.half: return v.cast(dtypes.half) if dtypes.is_float(v.dtype) else v.cast(dtypes.uint16).bitcast(dtypes.half)
   return v.cast(dt) if dt.itemsize != v.dtype.itemsize else v.bitcast(dt)
 
 # Float bit extraction - returns (bits, exp_mask, mant_mask, quiet_bit, exp_shift) based on float type
@@ -277,8 +277,17 @@ def _ldexp(val: UOp, exp: UOp) -> UOp:
   is_special = (bits & abs_max).eq(_const(bits.dtype, 0)) | ((bits & abs_max) >= abs_max)
   return is_special.where(val, res)
 
+def _pow2(_base: UOp, v: UOp) -> UOp:
+  f = v if dtypes.is_float(v.dtype) else v.bitcast(dtypes.float32)
+  return UOp(Ops.EXP2, src=(f.cast(dtypes.float32),)).cast(f.dtype)
+
 def _frexp_mant(val: UOp) -> UOp:
   val = val.bitcast(dtypes.float32) if val.dtype == dtypes.uint32 else val.bitcast(dtypes.float64) if val.dtype == dtypes.uint64 else val
+  if val.dtype == dtypes.half:
+    bits = val.bitcast(dtypes.uint16)
+    return ((bits & _const(dtypes.uint16, 0x7C00)).ne(_const(dtypes.uint16, 0))).where(
+      ((bits & _const(dtypes.uint16, 0x83FF)) | _const(dtypes.uint16, 0x3800)).bitcast(dtypes.half),
+      (bits & _const(dtypes.uint16, 0x8000)).bitcast(dtypes.half))
   if val.dtype == dtypes.float32:
     bits = val.bitcast(dtypes.uint32)
     # denormal/zero inputs (exponent field == 0) return signed zero on hardware
@@ -363,7 +372,7 @@ _FUNCS: dict[str, Callable[..., UOp]] = {
   'isEven': lambda a: (UOp(Ops.TRUNC, src=(a,)).cast(dtypes.int) & _const(dtypes.int, 1)).eq(_const(dtypes.int, 0)),
   'max': lambda a, b: UOp(Ops.MAX, src=(a, b)),
   'min': lambda a, b: UOp(Ops.MAX, src=(a.neg(), b.neg())).neg(),
-  'pow': lambda a, b: UOp(Ops.EXP2, src=(b.bitcast(dtypes.float32),)),
+  'pow': _pow2,
   'fma': lambda a, b, c: a * b + c,
   'i32_to_f32': lambda a: a.cast(dtypes.int).cast(dtypes.float32),
   'u32_to_f32': lambda a: a.cast(dtypes.uint32).cast(dtypes.float32),
@@ -815,7 +824,7 @@ class Parser:
             ('BF',16): dtypes.bfloat16,
             ('B',32): dtypes.uint32, ('B',64): dtypes.uint64}.get((type_char, bits), dtypes.uint64 if bits > 32 else dtypes.uint32)
       if type_char == 'F' and inner.dtype in (dtypes.uint32, dtypes.uint64, dtypes.ulong, dtypes.int, dtypes.int64):
-        if inner.dtype.itemsize != dt.itemsize: inner = inner.cast(dtypes.uint32 if dt.itemsize == 4 else dtypes.uint64)
+        if inner.dtype.itemsize != dt.itemsize: inner = inner.cast({2: dtypes.uint16, 4: dtypes.uint32}.get(dt.itemsize, dtypes.uint64))
         return inner.bitcast(dt)
       return inner.cast(dt)
     if self.at('IDENT'):
