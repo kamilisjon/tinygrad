@@ -2035,7 +2035,9 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
             if queue is not None:
               sqtt_exec(queue, exec_at:=max(cycle + latency, pipe_free.get(queue, 0)))
               pipe_free[queue] = exec_at + occupancy
-            cycle += 1
+              # the wave cannot dispatch faster than the pipe drains, it stays one latency ahead of its exec slot
+              cycle = max(cycle + 1, pipe_free[queue] - latency)
+            else: cycle += 1
           if is_barrier: break  # s_barrier hit: PC already advanced past it, pause this wave
         else: raise RuntimeError("exceeded 1M instructions in single wave, likely infinite loop")
       # All waves have either hit barrier or endpgm — release barrier waves for next round

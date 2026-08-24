@@ -37,6 +37,22 @@ def salu_timing(op) -> tuple[int, int]:
   extra, mul = (n:=op.name.lower()).startswith(_EXTRA_READ), "_mul" in n
   return 2 + 2*extra + mul, 2 if (mul or (len(srcs) == 2 and max(srcs) <= 32)) else 1
 
+_TRANSCENDENTAL = ('_exp_f', '_log_f', '_rcp_f', '_rcp_iflag', '_rsq_f', '_sqrt_f', '_sin_f', '_cos_f')
+_MUL_32X32 = ('v_mul_lo_u32', 'v_mul_hi_i32', 'v_mul_hi_u32', 'v_qsad_pk_u16_u8', 'v_mqsad_pk_u16_u8')
+_F64_3SRC = ('v_fma_f64', 'v_div_fixup_f64', 'v_div_fmas_f64')
+
+def valu_timing(op) -> tuple[int, int]:
+  from tinygrad.renderer.amd.dsl import OPERANDS
+  n, ops = op.name.lower(), OPERANDS.get(op) or {}
+  # f64 compares run on the 64 bit integer path, not the f64 arithmetic one
+  if 'f64' in n and not n.startswith('v_cmp'): return (39 if n in _F64_3SRC else 38), 32
+  if n == 'v_mqsad_u32_u8': return 13, 4
+  if n in _MUL_32X32: return 12, 4
+  # the sgpr destination of a compare is one index wide whatever the operands are, it does not make the op 64 bit
+  if any(w >= 64 for _f, (_fmt, w, k) in ops.items() if k.name != 'OPR_SREG'): return 10, 2
+  if any(t in n for t in _TRANSCENDENTAL): return 9, 4
+  return 9, 1
+
 def make_encoder():
   """Build an SQTT trace encoder for the emulator. Returns (emit, emit_exec, finish, finalize)."""
   from tinygrad.runtime.autogen.amd.rdna3.enum import SOPPOp as SOPPOp3
@@ -113,6 +129,7 @@ def make_encoder():
     else: _rec(cycle, INST, wave=w, op=(name:=_mem_op(inst_type, op_name)))
     queue, occupancy = pipe_of(name if isinstance(name, str) else name.name)
     if queue == "SALU" and hasattr(inst, "op"): return (queue, *salu_timing(inst.op))
+    if queue == "VALU" and hasattr(inst, "op"): return (queue, *valu_timing(inst.op))
     return queue, occupancy, occupancy
 
   def emit_exec(queue: str, cycle: int):
