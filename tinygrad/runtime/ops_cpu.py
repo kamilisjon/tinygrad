@@ -26,24 +26,24 @@ MAX_ARGS, CMD_SIZE, RING_SLOTS, FUNCS = 63, 64, (16 << 10), (() if WIN else ('cl
 
 def signal_prog():
   val = UOp.param(1, dtypes.int, (), vmin_vmax=(0, dtypes.int.max), name="value", addrspace=AddrSpace.ALU)
-  return UOp.param(0, dtypes.uint32, (1,))[0].store(val.cast(dtypes.uint32))
+  return UOp.param(0, dtypes.uint32, 1)[0].store(val.cast(dtypes.uint32))
 
 def wait_prog():
   val = UOp.param(1, dtypes.int, (), vmin_vmax=(0, dtypes.int.max), name="value", addrspace=AddrSpace.ALU)
-  return (v:=UOp.param(0, dtypes.uint32, (1,), volatile=True).after(l:=UOp.loop(0))[0].load()).end(l, v < val.cast(dtypes.uint32))
+  return (v:=UOp.param(0, dtypes.uint32, 1, volatile=True).after(l:=UOp.loop(0))[0].load()).end(l, v < val.cast(dtypes.uint32))
 
 def timestamp_prog():
   if WIN: val = UOp.const(0, dtypes.uint64)
   else:
-    fn, ts = UOp.param(1, dtypes.uint64, (1,)), UOp.placeholder((2,), dtypes.uint64, slot=0, addrspace=AddrSpace.REG)
+    fn, ts = UOp.param(1, dtypes.uint64, 1), UOp.placeholder((2,), dtypes.uint64, slot=0, addrspace=AddrSpace.REG)
     call = fn[0].load().call(UOp.const(6 if OSX else 1, dtypes.int), ts[0], ret_dtype=dtypes.void) # clock_gettime(CLOCK_MONOTONIC, &ts)
     val = ts.after(call)[0].load() * 1_000_000_000 + ts.after(call)[1].load()
-  return UOp.param(0, dtypes.uint64, (1,))[0].store(val)
+  return UOp.param(0, dtypes.uint64, 1)[0].store(val)
 
 def worker_prog():
-  ring = UOp.param(0, dtypes.uint64, (RING_SLOTS * CMD_SIZE,), volatile=True)
-  wait, done = UOp.param(1, dtypes.uint64, (1,), volatile=True), UOp.param(2, dtypes.uint64, (1,), volatile=True)
-  sem, cur = UOp.param(3, dtypes.uint64, (1,)), UOp.range(2**64-1, 0, dtype=dtypes.uint64) # sem is unused on windows, it has to come last
+  ring = UOp.param(0, dtypes.uint64, RING_SLOTS * CMD_SIZE, volatile=True)
+  wait, done = UOp.param(1, dtypes.uint64, 1, volatile=True), UOp.param(2, dtypes.uint64, 1, volatile=True)
+  sem, cur = UOp.param(3, dtypes.uint64, 1), UOp.range(2**64-1, 0, dtype=dtypes.uint64) # sem is unused on windows, it has to come last
 
   # spin on windows, sem_wait to sleep on posix
   if WIN: ready = (v:=wait.after(lw:=UOp.loop(1), cur)[0].load()).end(lw, v <= cur)
@@ -61,25 +61,25 @@ class CPUWorker: ring:Buffer; put:Buffer; sem:Buffer; sys:Buffer; done:Buffer; t
 def cpu_cmd(devs:tuple[str, ...], prog, *args:UOp) -> UOp:
   progs = [get_runtime(d, prog) if isinstance(prog, UOp) else cast(CPUDevice, Device[d]).prgs[prog] for d in devs]
   addrs = tuple(UOp.const(p.addr, dtypes.uint64) for p in progs)
-  words = ((addrs[0] if len(addrs) == 1 else UOp(Ops.STACK, dtypes.uint64, addrs)),) + args
-  return UOp(Ops.INS, dtypes.void, words + (UOp.const(0, dtypes.uint64),) * (CMD_SIZE - len(words)), arg="cmd")
+  words = ((addrs[0] if len(addrs) == 1 else UOp(Ops.STACK, src=addrs)),) + args
+  return UOp(Ops.INS, src=words + (UOp.const(0, dtypes.uint64),) * (CMD_SIZE - len(words)), arg=("cmd", dtypes.void))
 
 def cpu_exec(ctx:tuple[str, ...], call:UOp, prg:UOp) -> UOp:
   args = [get_call_arg_uops(call)[i].getaddr(ctx) for i in prg.arg.globals] + [v.cast(dtypes.uint64) for v in get_call_var_uops(call, prg)]
   if (core:=prg.arg.runtimevars.get('core_id')) is None: return cpu_cmd(ctx, prg, *args)
 
   la = [cpu_cmd(ctx,prg,*args[:(cid:=(len(prg.arg.globals)+core))],UOp.const(t, dtypes.uint64),*args[cid+1:]) for t in range(prg.arg.global_size[0])]
-  return UOp(Ops.LINEAR, dtypes.void, tuple(la))
+  return UOp(Ops.LINEAR, src=tuple(la))
 
 pm_cpu_opsel = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="prg"),), name="call", allow_any_len=True), cpu_exec),
 
-  (UPat(Ops.INS, arg="barrier"), lambda: UOp(Ops.NOOP, dtypes.void, ())),
-  (UPat(Ops.INS, arg="wait", src=(UPat(name="dst"), UPat(name="val"))),
+  (UPat(Ops.INS, arg=("barrier", dtypes.void)), lambda: UOp(Ops.NOOP)),
+  (UPat(Ops.INS, arg=("wait", dtypes.void), src=(UPat(name="dst"), UPat(name="val"))),
    lambda ctx, dst, val: cpu_cmd(ctx, wait_prog, dst.getaddr(ctx), val.cast(dtypes.uint64))),
-  (UPat(Ops.INS, arg="store", src=(UPat((Ops.BUFFER, Ops.PARAM), name="dst"), UPat(name="val"))),
+  (UPat(Ops.INS, arg=("store", dtypes.void), src=(UPat((Ops.BUFFER, Ops.PARAM), name="dst"), UPat(name="val"))),
    lambda ctx, dst, val: cpu_cmd(ctx, signal_prog, dst.getaddr(ctx), val.cast(dtypes.uint64))),
-  (UPat(Ops.INS, arg="timestamp", src=(UPat(name="dst"),)),
+  (UPat(Ops.INS, arg=("timestamp", dtypes.void), src=(UPat(name="dst"),)),
    lambda ctx, dst: cpu_cmd(ctx, timestamp_prog, dst.getaddr(ctx), *(() if WIN else (make_buf(ctx, tag="func:clock_gettime").getaddr(ctx),)))),
 ])
 
