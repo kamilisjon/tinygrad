@@ -157,15 +157,15 @@ def capture_runs(fxn:Callable):
       prgs = {e.tag:e for e in Compiled.profile_events if type(e).__name__ == "ProfileProgramEvent"}
       assert (prg:=prgs.get(evs[0].kern)) is not None and prg.lib, f"no ProfileProgramEvent tagged {evs[0].kern}, is PROFILE=1 set?"
       lib = prg.lib
-    if pr:=sram_scope(evs[0].blob, lib, arch, simd): projs[simd] = pr
+    if pr:=sram_scope(evs[0].blob, lib, arch): projs[simd] = pr
     else: _phase = 1 - _phase  # out of phase, resync onto the same simd
   assert len(projs) == len(SIMDS), f"only landed on simds {sorted(projs)}, wanted {list(SIMDS)}"
   return [projs[s] for s in SIMDS], lib, arch
 
-def sram_scope(blob:bytes, lib:bytes, arch:str, simd:int=0) -> list[tuple[int, int|None, int, str]]:
+def sram_scope(blob:bytes, lib:bytes, arch:str) -> list[tuple[int, int|None, int, str]]:
   out: list[list] = []
   pending: dict[str, list[int]] = {}
-  for p, info in map_insts(blob, lib, arch, simd):
+  for p, info in map_insts(blob, lib, arch):
     if isinstance(p, (ALUEXEC, VMEMEXEC)):
       for q in (["VALU", "SALU"] if (n:=p.src.name) == "VALU_SALU" else [n]):
         if pending.get(q): out[pending[q].pop(0)][1] = p._time

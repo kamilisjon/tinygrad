@@ -376,7 +376,7 @@ wave_colors = {**{x:"#1F7857" for x in ["WMMA", "MFMA"]}, **{x:"#ffffc0" for x i
 def sqtt_timeline(data:bytes, lib:bytes, target:str) -> Generator[ProfileEvent, None, None]:
   from tinygrad.renderer.amd.sqtt import (map_insts, InstructionInfo, PacketType, INST, InstOp, VALUINST, IMMEDIATE, IMMEDIATE_MASK, VMEMEXEC,
                                           ALUEXEC, INST_RDNA4, InstOpRDNA4, TS_DELTA_OR_MARK, TS_DELTA_OR_MARK_RDNA4, CDNA_INST, InstOpCDNA,
-                                          CDNA_ISSUE, WAVEEND, WAVEEND_RDNA4, CDNA_WAVEEND, WAVERDY)
+                                          CDNA_ISSUE, WAVEEND, WAVEEND_RDNA4, CDNA_WAVEEND, WAVERDY, exec_queue_of)
   decoded = amd_decode((text:=get_elf_section(lib, ".text")).content, get_arch(target), text.header.sh_addr)
   pc_map = {addr:str(inst) for addr,inst in decoded.items()}
   row_ends:dict[str, Decimal] = {}
