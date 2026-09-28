@@ -1,6 +1,7 @@
 import unittest, itertools
+from dataclasses import replace
 
-from tinygrad.codegen.late.coalesce import indexing_simplify
+from tinygrad.codegen.late.coalesce import indexing_simplify, pm_simplify_add_image
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import UOp, Ops, graph_rewrite
 from tinygrad.uop.weak import pm_commit_weak
@@ -21,7 +22,7 @@ def get_load_image_uop(image_shape:tuple[int, ...], valid:UOp, idx:tuple[UOp, UO
   return UOp.param(0, dtypes.float, image_shape).index(idx[1].valid(valid), idx[0].valid(valid)).load()
 
 def Special(expr, nmax): return UOp.special(nmax, expr)
-def Variable(expr, nmin, nmax): return UOp.variable(expr, nmin, nmax, param=True)
+def Variable(expr, nmin, nmax): return UOp.variable(expr, nmin, nmax)
 def Range(n, nmax): return UOp.range(nmax, n)
 
 class TestValidIdxSimplification(unittest.TestCase):
@@ -59,6 +60,10 @@ class TestValidIdxSimplification(unittest.TestCase):
     alu0 = gidx0+ridx0
     valid = (alu0 < 57) & (alu0 >= 1)
     self.assertIsNone(simplify_valid(valid))
+
+  def test_bitwise_and_is_not_a_valid(self):
+    ridx0 = Range(0, 16)
+    self.assertEqual(simplify_valid_idx(UOp.sink((ridx0 & UOp.const(12, dtypes.int)) & ridx0)).src[0].render(), "((int)(r0)&12&(int)(r0))")
 
   def test_valid_order_matters1(self):
     ridx0 = Range(0, 2)
@@ -499,6 +504,15 @@ class TestImageSimplification(unittest.TestCase):
     off = graph_rewrite(load.sink(), pm_commit_weak+indexing_simplify).src[0].src[0]
     self.assertEqual(off.src[1].get_valid(), UOp.const(True))
 
+class TestImageStore(unittest.TestCase):
+  def test_half_store_converts_lane_by_lane(self):
+    # a half4 stored to a half image converts to float per lane: a half4->float4 CAST is not valid OpenCL
+    img = UOp.param(0, dtypes.half, 256)
+    img = img.replace(arg=replace(img.arg, image=(8, 8)))
+    gidx0, gidx1 = Special("gidx0", 8), Special("gidx1", 8)
+    store = graph_rewrite(img.index(gidx1, gidx0).store(UOp.param(1, dtypes.half, (64, 4)).index(gidx1*8+gidx0)), pm_simplify_add_image)
+    self.assertEqual([(s.op, s.shape) for s in store.src[1].src], [(Ops.CAST, ())]*4)
+
 class TestDropTrueGate(unittest.TestCase):
   def test_drop_true_gate_on_index(self):
     # test that INDEX with a constant True valid gets simplified to drop the valid
@@ -513,6 +527,13 @@ class TestDropTrueGate(unittest.TestCase):
     result = graph_rewrite(index_with_gate, sym+indexing_simplify)
     # the True valid should be dropped (INDEX should only have 2 sources)
     self.assertEqual(len(result.src), 2, "True valid should be dropped from INDEX")
+
+  def test_const_gate_clause_is_not_moved_to_load(self):
+    # a const clause constrains nothing, so moving it only adds "&True" to the load's valid
+    r0, r1 = Range(0, 32), Range(1, 32)
+    idx = UOp.param(0, dtypes.float, 1024).index((r0+r1+r1*32-31).valid((r0+r1<31).ne(True)))
+    where = UOp.const(True).where(idx, UOp.const(0.0))
+    self.assertIs(graph_rewrite(where, pm_move_where_on_load), where)
 
 class TestRangeShrink(unittest.TestCase):
   def get_ranges(self, sink):
