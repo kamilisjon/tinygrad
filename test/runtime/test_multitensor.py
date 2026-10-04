@@ -69,7 +69,7 @@ class TestMultiTensor(unittest.TestCase):
     X.shard_(devices_2, 0)
     assert X.uop.src[0].shape == (128,)
     # the MULTI carries and ends the DEVICE range as its second src
-    assert X.uop.src[1].op is Ops.RANGE and X.uop.src[1].arg[-1] is AxisType.DEVICE
+    assert X.uop.src[1].op is Ops.RANGE and X.uop.src[1].axis_type is AxisType.DEVICE
     assert X.uop.ended_ranges == X.uop.src[1:]
     (X + X).realize()
 
@@ -692,6 +692,21 @@ class TestMultiTensor(unittest.TestCase):
     self.assertEqual(out.shape, (rows,))
     np.testing.assert_equal(out[:3].to(Device.DEFAULT).numpy(), np.full(3, 2))
 
+  def test_from_multibuffer(self):
+    buf = UOp.mstack(*(Tensor([i, i+1], device=d).realize().uop for i,d in enumerate((d0, d1)))).buffer
+    u = UOp.from_buffer(buf)
+    self.assertEqual((u.device, u.shape, u.buffer), (buf.device, (2,), buf))
+    self.assertEqual(Tensor(u.unshard(0)).to(Device.DEFAULT).tolist(), [0, 1, 1, 2])
+
+  def test_broadcast_symbolic(self):
+    data = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    x = Tensor(data)[:, :Variable('rows', 1, 3).bind(2)].contiguous().realize()
+    np.testing.assert_equal(x.to((d0, d1)).sum(1).to(Device.DEFAULT).numpy(), data[:, :2].sum(1))
+
+  def test_broadcast_expand(self):
+    x = Tensor(np.arange(6, dtype=np.float32).reshape(2, 3, 1)).realize()
+    np.testing.assert_equal(x.expand(2, 3, 4).to((d0, d1)).sum(1).to(Device.DEFAULT).numpy(), [[3]*4, [12]*4])
+
   def test_multitensor_jit_in_list(self):
     # test MULTI tensor inside a list container - exercises the container unpacking + MULTI unpacking
     @TinyJit
@@ -914,7 +929,7 @@ class Test2DShard(unittest.TestCase):
   @needs_second_gpu
   def setUp(self):
     self.devices_4 = tuple(f"{Device.DEFAULT}:{i}" for i in range(4))
-    self.rng = UOp.range(4, -1, AxisType.DEVICE)
+    self.rng = UOp.range(4, 0, AxisType.DEVICE)
     self.rng0, self.rng1 = self.rng // 2, self.rng % 2
 
   def _shard_2d(self, t:Tensor) -> Tensor:

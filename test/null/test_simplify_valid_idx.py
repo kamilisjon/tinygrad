@@ -63,7 +63,7 @@ class TestValidIdxSimplification(unittest.TestCase):
 
   def test_bitwise_and_is_not_a_valid(self):
     ridx0 = Range(0, 16)
-    self.assertEqual(simplify_valid_idx(UOp.sink((ridx0 & UOp.const(12, dtypes.int)) & ridx0)).src[0].render(), "((int)(r0)&12&(int)(r0))")
+    self.assertEqual(simplify_valid_idx(UOp.sink((ridx0 & UOp.const(12, dtypes.int)) & ridx0)).src[0].render(), "((i32)(r0)&12&(i32)(r0))")
 
   def test_valid_order_matters1(self):
     ridx0 = Range(0, 2)
@@ -84,6 +84,13 @@ class TestValidIdxSimplification(unittest.TestCase):
 
     for v in itertools.permutations([v0,v1,v2,v3]):
       self.assertEqual(simplify_valid(v[0]&v[1]&v[2]&v[3]).render(), "False")
+
+  def test_valid_stronger_bound_first(self):
+    # A weaker bound on the whole sum must not hide the tighter bound on r5 (CL IMAGE replay).
+    r3, r5 = Range(3, 2), Range(5, 8)
+    for clauses in itertools.permutations([r5<7, r3*7+r5<8, r3*7+r5<7]):
+      valid = graph_rewrite(UOp.uprod(*clauses), sym)
+      self.assertEqual(set(valid.split_uop(Ops.AND)), {r5<7, r3<1})
 
   def test_simplify_valid_from_div(self):
     x = Variable("x", -100, 100)
