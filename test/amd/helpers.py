@@ -9,6 +9,7 @@ import tinygrad.runtime.ops_amd  # noqa: F401  registers the SQTT_* ContextVars
 from tinygrad.helpers import unwrap
 from tinygrad.runtime.autogen import llvm
 from tinygrad.runtime.support.elf import elf_loader
+from tinygrad.runtime.support.hcq2 import hcq_compile_cache
 
 ARCH_TO_TARGET:dict[str, list[str]] = {
   "rdna3":["gfx1100", "gfx1102", "gfx1151"],
@@ -148,9 +149,10 @@ def capture_runs(fxn:Callable):
     if len(projs) == len(SIMDS): break
     simd, _phase = SIMDS[_phase], 1 - _phase
     st = len(Compiled.profile_events)
+    hcq_compile_cache.clear()  # SQTT_SIMD_SEL is baked into the compiled command stream, which is not keyed on it
     with Context(SQTT_LIMIT_SE=1, SQTT_ITRACE_SE_MASK=1, SQTT_SIMD_SEL=simd):
       Tensor.custom_kernel(a, fxn=fxn)[0].realize()
-    Device[Device.DEFAULT].synchronize()
+      Device[Device.DEFAULT].synchronize()  # itrace is read from SQTT_ITRACE_SE_MASK when events are collected
     evs = [e for e in Compiled.profile_events[st:] if type(e).__name__ == "ProfileSQTTEvent" and e.itrace]
     assert len(evs) == 1, f"expected one instruction-traced SQTT event, got {len(evs)}, is SQTT=1 set?"
     if lib is None:

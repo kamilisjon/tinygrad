@@ -1,5 +1,5 @@
 import unittest
-from tinygrad import Device
+from tinygrad import Device, dtypes
 from tinygrad.helpers import colored, DEBUG
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.renderer.amd.dsl import s, v, M0, OPERANDS
@@ -22,7 +22,7 @@ def _kernel(name:str, insts:list):
   def fxn(A:UOp) -> UOp:
     threads, wg = UOp.special(32, "lidx0"), UOp.special(1, "gidx0")
     sink = UOp.sink(A.flatten().base, threads, wg, arg=KernelInfo(name))
-    return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=x) for x in insts]))))
+    return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=(x, dtypes.void)) for x in insts]))))
   return fxn
 
 SWEEP_REPEATS = 30

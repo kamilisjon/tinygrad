@@ -197,7 +197,8 @@ class AMDev:
           raise RuntimeError("Malformed state. Use extra/amdpci/hive_reset.py to reset the hive")
         # Quiesce first: mode1 reset over live engines at max clocks can wedge the GPU until power cycled.
         self.gfx.fini_hw()
-        self.smu.set_clocks(level=0)
+        # amdgpu disables DPM on unbind, so the smu rejects clock queries (0xfd); clocks are not at max then anyway
+        with contextlib.suppress(TimeoutError): self.smu.set_clocks(level=0)
         self.gfx.halt_engines()
         self.sdma.halt_engines()
         time.sleep(0.1)
